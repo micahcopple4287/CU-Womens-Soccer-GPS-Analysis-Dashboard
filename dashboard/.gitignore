@@ -1,0 +1,37 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+.env
+
+# --- IDE ---
+.idea/
+.vscode/
+
+# --- App caches (RAG TF-IDF cache — safe to regenerate) ---
+.rag_cache/
+
+# --- Logs / temp ---
+*.log
+*.tmp
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+
+# --- Sensitive / large team data (keep out of public repos) ---
+# Catapult exports, athletic-trainer logs, wellness surveys, schedules, and
+# match-level box scores can contain identifiable athlete information.
+Data/
+outputs/
+*.csv
+*.xlsx
+
+# --- Streamlit ---
+.streamlit/secrets.toml

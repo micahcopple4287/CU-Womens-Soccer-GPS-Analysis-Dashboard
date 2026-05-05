@@ -1,0 +1,3091 @@
+---
+title: "Microcycle Analysis and Velocity Zone Optimization"
+output:
+  html_document:
+    self_contained: true
+date: "2026-03-02"
+author: "Micah Copple"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(ggplot2)
+library(readxl)
+```
+
+I first need to merge the schedule data so that I can calculate MD- dates for each session between 2023 and 2025. This is crucial for the analysis
+
+```{r}
+schedule_2023_raw <- read_excel("2023 Schedule.xlsx", skip = 9)
+
+schedule_2023 <- schedule_2023_raw %>%
+  select(Date = 1) %>%
+  filter(!is.na(Date), Date != "Date") %>%
+  mutate(
+    
+    # Extract just the date part, we don't want the (THU) in it
+    date_clean = str_extract(Date, "^[A-Za-z]+ \\d+"),
+    # Add year
+    date_clean = paste(date_clean, "2023"),
+    # Parse to date
+    game_date = mdy(date_clean),
+    season = "2023"
+  ) %>%
+  filter(!is.na(game_date)) %>%
+  select(game_date, season)
+```
+
+same with 2024
+
+```{r}
+schedule_2024_raw <- read_excel("2024 Schedule.xlsx", skip = 7)
+  
+schedule_2024 <- schedule_2024_raw %>%
+  select(Date = 1) %>%
+  filter(!is.na(Date), Date != "Date") %>%
+  mutate(
+    date_clean = str_extract(Date, "^[A-Za-z]+ \\d+"),
+    date_clean = paste(date_clean, "2024"),
+    game_date = mdy(date_clean),
+    season = "2024"
+  ) %>%
+  filter(!is.na(game_date)) %>%
+  select(game_date, season)
+```
+same with 2025
+
+```{r}
+schedule_2025_raw <- read_excel("2025 Schedule.xlsx", skip = 7)
+
+schedule_2025 <- schedule_2025_raw %>%
+  select(Date = 1) %>%
+  filter(!is.na(Date), Date != "Date") %>%
+  mutate(
+    date_clean = str_extract(Date, "^[A-Za-z]+ \\d+"),
+    date_clean = paste(date_clean, "2025"),
+    game_date = mdy(date_clean),
+    season = "2025"
+  ) %>%
+  filter(!is.na(game_date)) %>%
+  select(game_date, season)
+
+#combine
+full_schedule <- bind_rows(
+  schedule_2023,
+  schedule_2024,
+  schedule_2025
+) %>%
+  arrange(game_date)
+```
+
+Now that we have our schedules, we can join these into a full schedule dataset that we can use to calculate MD- 
+
+```{r}
+full_schedule <- bind_rows(
+  schedule_2023,
+  schedule_2024,
+  schedule_2025
+) %>%
+  arrange(game_date)
+```
+
+```{r}
+game_dates <- full_schedule %>%
+  pull(game_date) %>%
+  unique() %>%
+  sort()
+```
+
+Read in csv
+```{r}
+catapult_2023_2025_csv <- read_csv("catapult_2023_2025_csv.csv")
+```
+
+Now fill positions
+```{r}
+position_lookup <- catapult_2023_2025_csv %>%
+  filter(!is.na(position_name)) %>%
+  group_by(player_id) %>%
+  count(position_name, sort = TRUE) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(player_id, primary_position = position_name)
+
+catapult_fixed <- catapult_2023_2025_csv %>%
+  left_join(position_lookup, by = "player_id") %>%
+  mutate(
+    position_name = coalesce(position_name, primary_position)
+  ) %>%
+  select(-primary_position)
+```
+
+Clean up and add MD-
+```{r}
+catapult <- catapult_fixed %>%
+  filter(
+    total_player_load < 2000,
+    total_distance < 20
+  ) %>%
+  mutate(
+    position_name = case_when(
+      position_name %in% c("Center Back", "Outside Back", "Defender") ~ "Defender",
+      TRUE ~ position_name
+    ),
+    date = as.Date(date),
+    diff_days = sapply(date, function(d) {
+      future_games <- game_dates[game_dates > d]
+      if (length(future_games) == 0) return(NA_real_)
+      else return(as.numeric(min(future_games) - d))
+    }),
+    `MD-` = if_else(diff_days %in% 1:6, paste0("MD-", diff_days), NA_character_)
+  )
+```
+
+Find MD-3 Averages (since MD-3 has the highest average total player load)
+```{r}
+load_var <- "total_player_load"
+
+md3_averages <- catapult %>%
+  filter(`MD-` == "MD-3") %>%
+  group_by(player_id) %>%
+  summarise(
+    md3_mean_load = mean(.data[[load_var]], na.rm = TRUE),
+    md3_n_sessions = n(),
+    md3_load_sd = sd(.data[[load_var]], na.rm = TRUE),
+    .groups = "drop"
+  )
+
+```
+
+Join and find spike ratio
+```{r}
+catapult_with_spike <- catapult %>%
+  left_join(md3_averages, by = "player_id") %>%
+  mutate(
+    spike_ratio = if_else(
+      is.na(md3_mean_load) | md3_mean_load == 0,
+      NA_real_,
+      .data[[load_var]] / md3_mean_load
+    )
+  )
+```
+
+Select variables and rename
+```{r}
+catapult_with_spike <- catapult_with_spike %>%
+  select(
+    `Player ID` = player_id,
+    Date = date,
+    Position = position_name,
+    `Total Distance` = total_distance,
+    `Total Player Load` = total_player_load,
+    `Total Acceleration Load` = total_acceleration_load,
+    `MD-`,
+    md3_mean_load,
+    md3_n_sessions,
+    spike_ratio
+  ) %>%
+  filter(
+    !is.na(`Total Distance`),
+    !is.na(`Total Player Load`),
+    `Total Distance` > 0
+  )
+
+```
+
+
+```{r}
+catapult_with_spike <- catapult_with_spike %>%
+  group_by(`Player ID`, Date) %>%
+  slice_max(`Total Distance`, n = 1) %>%
+  ungroup()
+```
+
+
+
+
+
+#___________________________________________________________________________________________________________________________
+
+
+# MD- Analysis WITH OFFSEASON AND PRESEASON 
+
+
+## In Season Analysis
+
+```{r}
+typical_md_profile <- catapult_with_spike %>%
+  filter(!is.na(`MD-`), !is.na(`Total Distance`), `Total Distance` > 0) %>%
+  group_by(`MD-`) %>%
+  summarise(
+    number_of_sessions = n(),
+    dist_mean = mean(`Total Distance`, na.rm = TRUE),
+    dist_sd = sd(`Total Distance`, na.rm = TRUE),
+    load_mean = mean(`Total Player Load`, na.rm = TRUE),
+    load_sd = sd(`Total Player Load`, na.rm = TRUE),
+    accel_mean = mean(`Total Acceleration Load`, na.rm = TRUE),
+    accel_sd = sd(`Total Acceleration Load`, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(`MD-`))
+```
+
+
+visualize mean miles run (mean total distance) by MD-
+```{r}
+# Distance by MD-
+ggplot(typical_md_profile, aes(x = fct_reorder(`MD-`, desc(`MD-`)))) +
+  geom_col(aes(y = dist_mean), fill = "darkblue", alpha = 0.7) +
+  geom_errorbar(aes(ymin = dist_mean - dist_sd, ymax = dist_mean + dist_sd), 
+                width = 0.2) +
+  labs(
+    title = "Usual Total Distance by Match Day Minus",
+    subtitle = "Microcycle Load Structure: MD-6 through MD-1",
+    x = "Match Day Minus",
+    y = "Total Distance (miles)"
+  ) +
+  theme_bw()
+```
+
+
+```{r}
+# Player Load by MD-
+ggplot(typical_md_profile, aes(x = fct_reorder(`MD-`, desc(`MD-`)))) +
+  geom_col(aes(y = load_mean), fill = "darkblue", alpha = 0.7) +
+  geom_errorbar(aes(ymin = load_mean - load_sd, ymax = load_mean + load_sd), 
+                width = 0.2) +
+  labs(
+    title = "Usual Total Player Load by Match Day Minus",
+    subtitle = "Microcycle Load Structure: MD-6 through MD-1",
+    x = "Match Day Minus",
+    y = "Average Total Player Load"
+  ) +
+  theme_bw()
+```
+
+
+Highest, lowest, and most variable MD- based on distance ran
+```{r}
+highest_md <- typical_md_profile %>% 
+  filter(dist_mean == max(dist_mean, na.rm = TRUE)) %>% 
+  pull(`MD-`)
+
+lowest_md <- typical_md_profile %>% 
+  filter(dist_mean == min(dist_mean, na.rm = TRUE)) %>% 
+  pull(`MD-`)
+
+most_variable_md <- typical_md_profile %>% 
+  filter(dist_sd == max(dist_sd, na.rm = TRUE)) %>% 
+  pull(`MD-`)
+
+
+
+print(highest_md)
+print(lowest_md)
+print(most_variable_md)
+```
+
+This is the same for total player load
+
+
+
+
+
+Now we need to look at MD- distribution by POSITION 
+```{r}
+position_md_profile <- catapult_with_spike %>%
+  filter(!is.na(`MD-`), !is.na(`Total Distance`), `Total Distance` > 0, !is.na(Position)) %>%
+  group_by(Position, `MD-`) %>%
+  summarise(
+    n_sessions = n(),
+    dist_mean = mean(`Total Distance`, na.rm = TRUE),
+    load_mean = mean(`Total Player Load`, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+
+Visualize microcycle by position
+```{r}
+ggplot(position_md_profile, aes(x = fct_reorder(`MD-`, desc(`MD-`)), 
+                                  y = dist_mean, 
+                                  color = Position, 
+                                  group = Position)) +
+  geom_line(linewidth = 0.5) +
+  geom_point(size = 2) +
+  labs(
+    title = "Microcycle Average Total Distance Pattern by Position",
+    subtitle = "Do different positions peak on different days?",
+    x = "Match Day Minus",
+    y = "Average Total Distance (miles)"
+  ) +
+  theme_bw() +
+  theme(legend.position = "right")
+```
+
+
+
+```{r}
+ggplot(position_md_profile, aes(x = fct_reorder(`MD-`, desc(`MD-`)), 
+                                  y = Position, 
+                                  fill = dist_mean)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(dist_mean, 2)), color = "white", size = 3) +
+  scale_fill_gradient(low = "darkblue", high = "red", name = "Avg Distance (miles)") +
+  labs(
+    title = "Load Heatmap: Position and Match Day Minus",
+    subtitle = "Shows which positions work hardest on which MD- days",
+    x = "Match Day Minus",
+    y = "Position"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+ggplot(position_md_profile, aes(x = fct_reorder(`MD-`, desc(`MD-`)), 
+                                  y = load_mean, 
+                                  color = Position, 
+                                  group = Position)) +
+  geom_line(linewidth = 0.5) +
+  geom_point(size = 2) +
+  labs(
+    title = "Microcycle Average Total Load Pattern by Position",
+    subtitle = "Do different positions peak on different days?",
+    x = "Match Day Minus",
+    y = "Average Total Player Load"
+  ) +
+  theme_bw() +
+  theme(legend.position = "right")
+```
+
+```{r}
+ggplot(position_md_profile, aes(x = fct_reorder(`MD-`, desc(`MD-`)), 
+                                  y = Position, 
+                                  fill = load_mean)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(load_mean, 0)), color = "white", size = 3) +
+  scale_fill_gradient(low = "darkblue", high = "red", name = "Avg Total Player Load") +
+  labs(
+    title = "Load Heatmap: Position and Match Day Minus",
+    subtitle = "Shows which positions work hardest on which MD- days",
+    x = "Match Day Minus",
+    y = "Position"
+  ) +
+  theme_minimal()
+```
+MD-5 has the highest average total distance ran and total player load between 2023-2025 (Proprietary Workload Metric from Catapult).  
+
+
+
+I am going to calculate position specific MD- norms using the Total Player Load variable. First I have to exclude offseason and game day data from the set. 
+```{r}
+microcycle_analysis <- catapult_with_spike %>%
+  filter(
+    !is.na(`MD-`),
+    `MD-` %in% c("MD-1", "MD-2", "MD-3", "MD-4", "MD-5", "MD-6"),
+    !is.na(`Total Player Load`),
+    `Total Player Load` > 0,
+    !is.na(Position)
+  ) %>%
+  mutate(
+    
+    # need to merge center back and outside back into defender for more stable norms
+    Position = case_when(
+      Position %in% c("Center Back", "Outside Back", "Defender") ~ "Defender",
+      TRUE ~ Position
+  )
+  
+  )
+```
+
+
+Now I can calculate the norms for each position on each MD- day to get a good understanding of when a "spike" will happen
+```{r}
+position_md_norms <- microcycle_analysis %>%
+  group_by(Position, `MD-`) %>%
+  summarise(
+    n_sessions = n(),
+    load_mean = mean(`Total Player Load`, na.rm = TRUE),
+    load_sd = sd(`Total Player Load`, na.rm = TRUE),
+    load_median = median(`Total Player Load`, na.rm = TRUE),
+    load_p25 = quantile(`Total Player Load`, 0.25, na.rm = TRUE),
+    load_p75 = quantile(`Total Player Load`, 0.75, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+```
+
+
+Now that we have position based norms for each MD- day up to MD-6, I need a way to detect outliers by position on each day. I will be using a tiered system to flag these outliers. Anything greater than 3 SD away from the position mean is extrememly rare, and could be an error in the data. Anything between 2.5 and 3 SDs away from the position mean is critically high, and carries a risk of injury. Anything between 2 and 2.5 SDs away from position mean is moderately high,  and needs to be monitored. Anything less than -2 SDs away from position mean is unusually low, and could mean the player might have missed training. Anything else (0 SDs to 2 SDs) is considered normal and will not be flagged. 
+
+```{r}
+outlier_sessions <- microcycle_analysis %>%
+  left_join(position_md_norms %>% 
+              select(Position, `MD-`, load_mean, load_sd),
+            by = c("Position", "MD-")) %>%
+  mutate(
+    Year = year(Date),
+    # Z-score
+    load_zscore = (`Total Player Load` - load_mean) / load_sd,
+    
+    # Tiered outlier categories
+    outlier_category = case_when(
+      load_zscore > 3.0 ~ "Extreme High",
+      load_zscore > 2.5 ~ "Critical High",
+      load_zscore > 2.0 ~ "Moderate High",
+      load_zscore < -2.0 ~ "Unusually Low",
+      TRUE ~ "Normal"
+    ),
+    
+    is_outlier = abs(load_zscore) > 2.0
+  )
+```
+
+
+
+```{r}
+# Get outliers only
+outliers_only <- outlier_sessions %>%
+  filter(is_outlier == TRUE) %>%
+  select(`Player ID`, Date, Year, `MD-`, Position, `Total Player Load`, 
+         load_mean, load_zscore, outlier_category) %>%
+  arrange(desc(abs(load_zscore)))
+```
+
+
+```{r}
+outlier_summary <- outlier_sessions %>%
+  group_by(Position, `MD-`, Year) %>%
+  summarise(
+    n_sessions = n(),
+    n_outliers = sum(is_outlier),
+    pct_outliers = 100 * n_outliers / n_sessions,
+    n_extreme = sum(outlier_category == "Extreme High"),
+    n_critical = sum(outlier_category == "Critical High"),
+    n_moderate = sum(outlier_category == "Moderate High"),
+    n_low = sum(outlier_category == "Unusually Low"),
+    .groups = "drop"
+  ) %>%
+  filter(n_outliers > 0) %>%
+  arrange(desc(pct_outliers))
+```
+
+
+
+```{r}
+outlier_counts <- outlier_sessions %>%
+  filter(is_outlier == TRUE) %>%
+  group_by(Position, outlier_category) %>%
+  summarise(n = n(), .groups = "drop")
+
+ggplot(outlier_counts, aes(x = n, y = Position, fill = outlier_category)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("Extreme High" = "darkred", 
+                                "Critical High" = "red", 
+                                "Moderate High" = "orange",
+                                "Unusually Low" = "lightblue")) +
+  labs(
+    title = "Outlier Sessions by Position",
+    subtitle = "Sessions >2 SD from position-specific MD- norm",
+    x = "Number of Outlier Sessions",
+    y = "Position",
+    fill = "Outlier Category"
+  ) +
+  theme_bw()
+```
+
+Can also visualize these by MD- days to see which have the most outliers
+
+```{r}
+outlier_by_md <- outlier_sessions %>%
+  filter(is_outlier == TRUE) %>%
+  group_by(`MD-`, outlier_category) %>%
+  summarise(n = n(), .groups = "drop")
+
+ggplot(outlier_by_md, aes(x = fct_reorder(`MD-`, desc(`MD-`)), 
+                           y = n, 
+                           fill = outlier_category)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("Extreme High" = "darkred", 
+                                "Critical High" = "red", 
+                                "Moderate High" = "orange",
+                                "Unusually Low" = "lightblue")) +
+  labs(
+    title = "Outlier Sessions by Match Day Minus",
+    subtitle = "Which days have the most unusual sessions?",
+    x = "Match Day Minus",
+    y = "Number of Outlier Sessions",
+    fill = "Outlier Category"
+  ) +
+  theme_bw()
+```
+
+Finally, we can visualize the player load over time using an random example player. First I'll get a random example player
+```{r}
+set.seed(492)
+example_player <- catapult_with_spike %>%
+  count(`Player ID`) %>% 
+  filter(n >= 20) %>% 
+  slice_sample(n = 1) %>% 
+  pull(`Player ID`)
+```
+
+then add their data to a df
+```{r}
+player_data <- outlier_sessions %>%
+  filter(`Player ID` == example_player) %>%
+  arrange(Date)
+```
+
+then create the graph. Add an if(nrow(player_data > 0) just to make sure we actually have the player data
+```{r}
+if (nrow(player_data) > 0) {
+  ggplot(player_data, aes(x = Date, y = `Total Player Load`, color = outlier_category)) +
+    geom_line(color = "gray", alpha = 0.5) +
+    geom_point(size = 3) +
+    scale_color_manual(values = c("Normal" = "green", 
+                                  "Extreme High" = "darkred",
+                                  "Critical High" = "red",
+                                  "Moderate High" = "orange",
+                                  "Unusually Low" = "lightblue")) +
+    labs(
+      title = paste("Player Load Over Time For", example_player),
+      subtitle = "Outliers flagged (>2 SD from position-specific MD- norm)",
+      x = "Date",
+      y = "Total Player Load",
+      color = "Session Category"
+    ) +
+    theme_bw()
+  
+}
+```
+
+Now I'll look at which position and MD- combinations have the most frequent outliers
+
+```{r}
+high_outlier_combinations <- outlier_summary %>%
+  filter(pct_outliers > 10, n_sessions > 15) %>%
+  arrange(desc(pct_outliers))
+
+print(high_outlier_combinations, n=12)
+```
+
+Check outlier distribution by position
+
+```{r}
+outlier_by_position <- outlier_sessions %>%
+  filter(is_outlier == TRUE) %>%
+  group_by(`Position`, outlier_category) %>%
+  summarise(n = n(), .groups = "drop")
+
+print(outlier_by_position, n=23)
+```
+
+
+Now check real outlier distribution
+```{r}
+outlier_dist <- outlier_sessions %>%
+  filter(is_outlier == TRUE) %>%
+  group_by(outlier_category) %>%
+  summarise(n = n(), .groups = "drop")
+
+glimpse(outlier_dist)
+```
+
+
+I'll summarize these outlier sessions into a frequency dataset to get percentages of total sessions that are outliers. This will be more useful than the raw outlier numbers because some people may have more sessions than others, so we can use the ratio to get a better picture of the data. 
+
+```{r}
+player_outlier_frequency <- outlier_sessions %>%
+  group_by(`Player ID`, Position) %>%
+  summarise(
+    total_sessions = n(),
+    n_outliers = sum(is_outlier),
+    pct_outliers = 100 * n_outliers / total_sessions,
+    n_extreme = sum(outlier_category == "Extreme High"),
+    n_critical = sum(outlier_category == "Critical High"),
+    n_moderate = sum(outlier_category == "Moderate High"),
+    n_low = sum(outlier_category == "Unusually Low"),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(pct_outliers))
+```
+
+
+create visualization
+```{r}
+ggplot(player_outlier_frequency, aes(x = pct_outliers, y = Position, color = Position)) +
+  geom_jitter(width = 0.06, size = 2, alpha = 0.7) +
+  stat_summary(fun = mean, geom = "point", shape = 95, size = 10, color = "black") +
+  labs(
+    title = "Player Outlier Rates by Position",
+    subtitle = "Black bar = position average",
+    x = "Percentage of Sessions That Are Outliers",
+    y = "Position"
+  ) +
+  theme_bw() +
+  theme(legend.position = "none")
+```
+
+## In Season Analysis Interpretation (ALL SESSIONS ARE INCLUDED)
+
+From this 3 year analysis for in season sessions , we can see some key findings when it comes to the questions about MD- profiling (TOPIC 1)
+
+### 1) Microcycle Load Architecture: 
+
+For all positions, CU Boulder follows this microcycle pattern:
+
+Progressive load increase (MD-6 to MD-3)
+Peak stimulation 3 days before match (MD-3)
+Taper off to ensure freshness (MD-2, MD-1)
+
+
+We can see 2 specific phases in the microcycle:
+
+Phase 1 (MD-6 to MD-4): Build fitness, accumulate volume
+Phase 2 (MD-3 to MD-1): Peak, then recover
+
+
+### 2) Position Specific Training:
+
+From the analysis, we can see four different training profiles:
+
+DEFENDERS (Highest Load):
+Peak MD-3 load: 461 (highest of any position)
+Peak distance: 2.70 miles
+Why: Constant recovery runs, covering for teammates, tracking back
+Implication: Most fatigued going into matches, meaning this position has the highest injury risk
+
+MIDFIELDERS (High Volume And Variance):
+Peak MD-3 load: 441
+Peak distance: 2.5 miles
+Most outliers overall (83 total) - 35% of all outliers
+Why: Box-to-box running, transition play, both attack and defense
+Implication: Most variable workloads, so this position is the hardest to predict and manage
+
+FORWARDS (Moderate-High Load):
+Peak MD-3 load: 431
+Peak distance: 2.48 miles
+More balanced outlier profile (64 total, evenly distributed)
+Why: Sprinting, pressing, but less total distance than defenders
+Implication: Load comes from intensity, not volume
+
+GOALKEEPERS (Completely Different):
+Flat profile: 225-260 load across all days
+Distance: 1.4-1.7 miles (40% less than field players)
+Only 18 outliers total (lowest)
+Why: Position-specific training (shot-stopping, distribution)
+Implication: GKs need separate norms, and they don't periodize like field players
+
+
+### 3) The Outlier Story: What is Normal vs Concerning?
+
+Total Outliers: 236 sessions, which is 4.7% of dataset. This is exactly right for 2 SD threshold. We expected: ~5% (2.5% each tail. This means the position norms are well-calibrated. This is great news
+
+Distribution by Severity:
+
+Moderate High (91 sessions - 39%):
+Most common category, expected variation in training, and not super concerning. Players just pushed a little harder
+
+Unusually Low (71 sessions - 30%):
+Most interesting category for sure. Defenders had 21 (most of any position), forwards had 25 (highest rate relative to total sessions). Can be attributed to rest days, injury recovery, or planned rest for starters. 
+Implications: Good load management, coaches rotating players
+
+Critical High (41 sessions - 17%):
+Warrants attention but not alarm. Defenders had 16(most). Likely extra fitness work, return-to-play protocols, individual needs
+
+Extreme High (33 sessions - 14%):
+Genuine cause for concern
+Defenders: 12
+Midfielders: 9
+Forwards: 8
+Need to review these sessions for injury risk
+
+
+### 3) MD-2 Anomaly
+
+MD-2 shows a ton of variablilty. 52 "Unusually Low" outliers (most of any day by far), but also 23 "Extreme High" outliers
+Bimodal distribution. This means that some players rest, while others train hard. 
+
+Could be starters doing Light activation, tactical review, and resting while reserves do a full training session to maintain fitness
+
+MD-2 average (380-405) is moderate, but has a huge standard deviation (error bars in graphs). This creates outliers in both directions. 
+
+### 4) 2025 MD-1 Issue
+
+2025 Shows a HUGE Increase in MD-1 Outliers:
+
+2025 Outlier Rates: 
+Defenders MD-1: 23% (17/74 sessions)
+8 extreme and 5 critical out of 17
+Forwards MD-1: 19% (14/74)
+Midfielders MD-1: 11% (16/149)
+Goalkeepers MD-1: 13% (6/45)
+
+Compare that to 2023:
+
+Most positions: 0-5% outlier rate on MD-1
+Defenders MD-5 (2023): Only 5 outliers (15%)
+
+What Changed in 2025?
+Roster changes: new players not accustomed to taper
+Philosophy shift: moved to higher intensity activations
+Data quality: 2025 sessions tagged differently
+
+Something changed between 2023 and 2025
+MD-1 is supposed to be lightest day
+23% outlier rate is 4 times higher than expected
+
+
+### 5) Variability:
+
+MD-5 - Tallest error bars across all positions
+MD-2 - Also very tall (confirms bimodal hypothesis)
+
+Lowest Variability:
+
+MD-1 - Shortest bars (most consistent)
+MD-6 - Also consistent
+
+MD-5 Variability:
+Good thing, as coaches individualizing training
+Some players need more volume, others recovering
+Peak fitness day allows for customization
+
+MD-2 Variability:
+Expected, as starters vs reserves split
+But creates challenges with outlier detection
+
+MD-1 Consistency:
+Good thing - everyone does same activation
+Low variance = predictable pre-match prep
+Except in 2025!!!!
+
+
+### 6) Position Specific Peaks
+
+Defenders:
+3 Day Peak: MD-5, MD-4, and MD-3
+Nearly identical loads on all days, with MD-4 slightly less than the other two
+Defenders work hard throughout build phase
+
+
+Midfielders:
+Clear MD-3 peak (441), with MD-5 at a close second
+Drops significantly on MD-4 (393)
+Tactical prep dominates, less fitness work
+
+Forwards:
+MD-3 peak (431)
+But relatively flat MD-3 to MD-5 (408-431)
+Consistent load throughout week
+
+Goalkeepers:
+Very small MD-3 peak (257 vs 248 on MD-5)
+Essentially flat
+Position training overrides periodization
+
+
+### 7) Who Works the Hardest?
+
+Average Weekly Load (summing across all MD- days):
+Defenders: ~2,520 total weekly load
+Midfielders: ~2,440 total weekly load
+Forwards: ~2,340 total weekly load
+Goalkeepers: ~1,450 total weekly load (43% less than defenders)
+
+Distance Weekly Load:
+Defenders: ~14.5 miles/week
+Midfielders: ~14.2 miles/week
+Forwards: ~13.5 miles/week
+Goalkeepers: ~9.2 miles/week
+
+This means:
+Defenders accumulate 10% more load than forwards
+This compounds over a season (25-30 games)
+Defenders need more recovery time to reduce injury risk
+
+### 8) Outlier Patterns by MD-
+
+MD-6: 10 outliers total
+Mostly moderate/critical
+Some players need extra recovery from last match
+
+MD-5: 9 outliers
+LOWEST outlier count despite highest loads
+MD-5 is PLANNED peak, and high loads are expected
+Norms accurately reflect typical MD-5 intensity
+
+MD-4: 27 outliers
+Moderate high dominates
+Build day with some customization
+
+MD-3: 35 outliers
+Mix of all categories
+Peak day creates variability
+
+MD-2: 68 outliers (MOST)
+52 unusually low + 16 high
+Starters rest, reserves train ?
+
+MD-1: 64 outliers
+Driven entirely by 2025 spike
+Without 2025, would be ~20 outliers, which is normal
+
+Outliers tend to cluster on MD-2 and MD-1 (taper phase), not build phase.
+
+
+# Off Season and Pre Season Analysis
+
+
+I will keep the in-season analysis exactly the same. However, I will add off season and pre season classifications to the unused sessions and do a similar analysis on those
+
+```{r}
+
+# check catapult_fixed for May/June
+catapult_fixed %>%
+  mutate(date = as.Date(date)) %>%
+  filter(month(date) %in% c(5, 6)) %>%
+  count(position_name, month(date)) %>%
+  print()
+
+# check if position_filled exists
+"position_filled" %in% names(catapult_fixed)
+
+# check both position columns
+catapult_fixed %>%
+  mutate(date = as.Date(date)) %>%
+  filter(month(date) %in% c(5, 6)) %>%
+  select(player_id, date, position_name, contains("position")) %>%
+  head(20) %>%
+  print()
+
+# check if the position lookup actually has those May/June players
+may_june_players <- catapult_2023_2025_csv %>%
+  mutate(date = as.Date(date)) %>%
+  filter(month(date) %in% c(5, 6)) %>%
+  pull(player_id) %>%
+  unique()
+
+position_lookup %>%
+  filter(player_id %in% may_june_players) %>%
+  print()
+```
+
+Only 2 players practicing in May and June. Could be summer break. 
+
+
+create a function that defines the phase of the season
+```{r}
+define_season_phase <- function(date) {
+  date <- as.Date(date)
+  month_num <- month(date)
+  
+  if (month_num >= 8 || month_num == 12) {
+    return("In-Season")        # Aug 1 - Dec 31
+  } else if (month_num >= 1 && month_num <= 5) {
+    return("Off-Season")       # Jan 1 - May 31
+  } else if (month_num == 6 || month_num == 7) {
+    return("Pre-Season")       # Jun 1 - Jul 31
+  }
+}
+```
+
+
+create catapult_all_phases dataset
+```{r}
+catapult_all_phases <- catapult_fixed %>%
+  mutate(
+    date = as.Date(date),
+    season_phase = map_chr(date, define_season_phase),
+    Position = case_when(
+      position_name %in% c("Center Back", "Outside Back", "Defender") ~ "Defender",
+      TRUE ~ position_name
+    )
+  ) %>%
+  rename(
+    `Player ID` = player_id,
+    Date = date,
+    `Total Player Load` = total_player_load,
+    `Total Distance` = total_distance
+  ) %>%
+  filter(
+    `Total Player Load` < 2000,
+    `Total Distance` < 20
+  )
+```
+
+
+
+I might as well check gym sessions by phase
+```{r}
+gym_sessions_by_phase <- catapult_all_phases %>%
+  filter(`Total Player Load` > 100, `Total Distance` < 1) %>%
+  count(season_phase, name = "gym_sessions")
+
+print(gym_sessions_by_phase)
+```
+
+
+Now we can calculate the TPL norms for offseason and preseason. Since we don't have the MD- notation for off/pre season, I'll calculate these norms by position. 
+
+```{r}
+offseason_preseason_norms <- catapult_all_phases %>%
+  filter(season_phase %in% c("Off-Season", "Pre-Season")) %>%
+  filter(
+    !is.na(`Total Player Load`),
+    `Total Player Load` > 0,
+    !is.na(Position)
+  ) %>%
+  group_by(Position, season_phase) %>%
+  summarise(
+    n_sessions = n(),
+    load_mean = mean(`Total Player Load`, na.rm = TRUE),
+    load_sd = sd(`Total Player Load`, na.rm = TRUE),
+    load_median = median(`Total Player Load`, na.rm = TRUE),
+    load_p25 = quantile(`Total Player Load`, 0.25, na.rm = TRUE),
+    load_p75 = quantile(`Total Player Load`, 0.75, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+```
+
+Now I'll do the same thing I did for the in season analysis. I'll add an outlier variable that is extreme high, critial high, moderate high, or unusually low based on the Z score. 
+
+```{r}
+offseason_preseason_outliers <- catapult_all_phases %>%
+  filter(season_phase %in% c("Off-Season", "Pre-Season")) %>%
+  filter(
+    !is.na(`Total Player Load`),
+    `Total Player Load` > 0,
+    !is.na(Position)
+  ) %>%
+  left_join(offseason_preseason_norms, by = c("Position", "season_phase")) %>%
+  mutate(
+    load_zscore = (`Total Player Load` - load_mean) / load_sd,
+    outlier_category = case_when(
+      load_zscore > 3.0 ~ "Extreme High",
+      load_zscore > 2.5 ~ "Critical High",
+      load_zscore > 2.0 ~ "Moderate High",
+      load_zscore < -2.0 ~ "Unusually Low",
+      TRUE ~ "Normal"
+    ),
+    is_outlier = abs(load_zscore) > 2.0
+  )
+```
+
+
+Now we can look at JUST the outlier counts
+```{r}
+offseason_preseason_outlier_summary <- offseason_preseason_outliers %>%
+  filter(is_outlier) %>%
+  count(season_phase, outlier_category) %>%
+  arrange(season_phase, outlier_category)
+
+print(offseason_preseason_outlier_summary)
+```
+
+We have barely any unusually low outliers in the offseason and preseason, only one throughout the whole off/pre season. 
+
+
+I'll save all of the outliers into their own set to analyze these later
+```{r}
+offseason_preseason_outliers_only <- offseason_preseason_outliers %>%
+  filter(is_outlier) %>%
+  select(`Player ID`, Date, Position, season_phase, `Total Player Load`, 
+         load_mean, load_zscore, outlier_category) %>%
+  arrange(desc(abs(load_zscore)))
+```
+
+
+I'll create a phase summary to compare the phases in a plot
+```{r}
+phase_summary <- catapult_all_phases %>%
+  filter(!is.na(`Total Player Load`), `Total Player Load` > 0, !is.na(Position)) %>%
+  group_by(season_phase, Position) %>%
+  summarise(
+    n_sessions = n(),
+    mean_load = mean(`Total Player Load`, na.rm = TRUE),
+    sd_load = sd(`Total Player Load`, na.rm = TRUE),
+    median_load = median(`Total Player Load`, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+phase_order <- c("Off-Season", "Pre-Season", "In-Season")
+
+```
+
+monthly data with phase labels
+```{r}
+
+monthly_with_phase <- catapult_all_phases %>%
+  filter(!is.na(`Total Player Load`), `Total Player Load` > 0, !is.na(Position)) %>%
+  mutate(
+    month_num = month(Date),
+    month_name = month(Date, label = TRUE, abbr = TRUE)
+  ) %>%
+  group_by(month_num, month_name, season_phase, Position) %>%
+  summarise(mean_load = mean(`Total Player Load`, na.rm = TRUE), .groups = "drop")
+```
+
+now create graph
+```{r}
+
+ggplot(monthly_with_phase, 
+       aes(x = factor(month_num), 
+           y = mean_load, 
+           color = Position, 
+           group = Position)) +
+  # background shading
+  annotate("rect", xmin = 0.5, xmax = 6, ymin = -Inf, ymax = Inf, 
+           alpha = 0.1, fill = "lightblue") +
+  annotate("rect", xmin = 6, xmax = 8, ymin = -Inf, ymax = Inf, 
+           alpha = 0.1, fill = "orange") +
+  annotate("rect", xmin = 8, xmax = 13, ymin = -Inf, ymax = Inf, 
+           alpha = 0.1, fill = "darkred") +
+ # phase labels
+  annotate("text", x = 3.5, y = max(monthly_with_phase$mean_load) * 0.98, 
+           label = "OFF-SEASON", size = 4, fontface = "bold", color = "steelblue") +
+  annotate("text", x = 7, y = max(monthly_with_phase$mean_load) * 0.98, 
+           label = "PRE", size = 4, fontface = "bold", color = "orange") +
+  annotate("text", x = 10.5, y = max(monthly_with_phase$mean_load) * 0.98, 
+           label = "IN-SEASON", size = 4, fontface = "bold", color = "darkred") +
+  # phase boundary lines
+  geom_vline(xintercept = 6, linetype = "dashed", linewidth = 0.8) +
+  geom_vline(xintercept = 8, linetype = "dashed", linewidth = 0.8) +
+  # Data
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 4) +
+  scale_x_discrete(labels = month.abb) +
+  labs(
+    title = "Periodization Pattern by Position (2023-2025)",
+    subtitle = "Monthly breakdown",
+    x = "Month",
+    y = "Average Total Player Load",
+    color = "Position"
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(size = 11),
+    plot.title = element_text(size = 14, face = "bold")
+  )
+```
+
+
+So there is only May/June Data in 2025, even in the original dataset, and it is all midfielders. Very odd. 
+
+
+
+
+I need to look at the monthly progression to see if the data matches the theory of ramping up during the off season, dropping at the beginning of the preseason, then slowing ramping back up to give improvement. 
+
+
+First I'll create a set that has month numbers, then I'll group by the month name and number and find the average load for each month over the 3 years. I'll also take a look at year by year progression to see how the three annual cycles we have  differ. 
+
+```{r}
+monthly_progression <- catapult_all_phases %>%
+  filter(!is.na(`Total Player Load`), `Total Player Load` > 0) %>%
+  mutate(
+    month_name = month(Date, label = TRUE, abbr = TRUE),
+    month_num = month(Date)
+  ) %>%
+  group_by(month_name, month_num, season_phase) %>%
+  summarise(
+    avg_load = mean(`Total Player Load`, na.rm = TRUE),
+    n_sessions = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(month_num)
+
+print(monthly_progression, n=12)
+```
+
+Can also visualize this monthly progression
+
+```{r}
+ggplot(monthly_progression, 
+       aes(x = factor(month_name, levels = month.abb), 
+           y = avg_load, 
+           group = 1)) +
+  geom_line(linewidth = 1.2, color = "steelblue") +
+  geom_point(aes(color = season_phase), size = 4) +
+  scale_color_manual(
+    values = c("Off-Season" = "lightblue", 
+               "Pre-Season" = "orange", 
+               "In-Season" = "darkred")
+  ) +
+  geom_vline(xintercept = 6, linetype = "dashed", linewidth = 0.8) +
+  geom_vline(xintercept = 8, linetype = "dashed", linewidth = 0.8) +
+  annotate("rect", xmin = 0.5, xmax = 6, ymin = -Inf, ymax = Inf, 
+           alpha = 0.05, fill = "lightblue") +
+  annotate("rect", xmin = 6, xmax = 8, ymin = -Inf, ymax = Inf, 
+           alpha = 0.05, fill = "orange") +
+  annotate("rect", xmin = 8, xmax = 12.5, ymin = -Inf, ymax = Inf, 
+           alpha = 0.05, fill = "darkred") +
+  labs(
+    title = "Monthly Average Training Load Pattern",
+    subtitle = "Off-season builds (Jan-May), pre-season dips then rebuilds (Jun-Jul), in-season peak (Aug-Dec)",
+    caption = "Note: May/June 2025 data limited to 2 midfielders",
+    x = "Month",
+    y = "Average Total Player Load",
+    color = "Season Phase"
+  ) +
+  theme_bw() 
+```
+
+There are some interesting takeaways from this graph:
+
+During the offseason (January to June), the total player load is building. This confirms the theory is being practiced. More specifically, January to April is relatively stable, then April to June ramps up hard, getting players ready for the season. 
+During the preseason, the total load is tapered, which is exactly like the theory. Between June and July, the load decreases sharply, indicating a hard taper. 
+
+
+August and December are very low, and I think there are a couple reasons for this:
+
+August: Could be fewer training sessions, as the season is just starting so matches are dominating the total load
+
+December: End of season and holidays could result in less training
+
+
+
+Now I'll check year by year
+
+```{r}
+monthly_by_year <- catapult_all_phases %>%
+  filter(!is.na(`Total Player Load`), `Total Player Load` > 0) %>%
+  mutate(
+    month_name = month(Date, label = TRUE, abbr = TRUE),
+    month_num = month(Date),
+    year = year(Date)
+  ) %>%
+  group_by(year, month_name, month_num) %>%
+  summarise(
+    avg_load = mean(`Total Player Load`, na.rm = TRUE),
+    n_sessions = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(year, month_num)
+```
+
+Create the visualization:
+```{r}
+ggplot(monthly_by_year, 
+       aes(x = factor(month_name, levels = month.abb), 
+           y = avg_load, 
+           color = factor(year), 
+           group = year)) +
+  geom_line(linewidth = 1, alpha = 0.8) +
+  geom_point(size = 3) +
+  scale_color_manual(
+    values = c("2023" = "#E63946", "2024" = "#457B9D", "2025" = "#2A9D8F"),
+    name = "Year"
+  ) +
+  geom_vline(xintercept = 6, linetype = "dashed", linewidth = 0.8) +
+  geom_vline(xintercept = 8, linetype = "dashed", linewidth = 0.8) +
+  annotate("rect", xmin = 0.5, xmax = 6, ymin = -Inf, ymax = Inf, 
+           alpha = 0.05, fill = "lightblue") +
+  annotate("rect", xmin = 6, xmax = 8, ymin = -Inf, ymax = Inf, 
+           alpha = 0.05, fill = "orange") +
+  annotate("rect", xmin = 8, xmax = 12.5, ymin = -Inf, ymax = Inf, 
+           alpha = 0.05, fill = "darkred") +
+  annotate("text", x = 3, y = max(monthly_by_year$avg_load) * 0.98, 
+           label = "OFF-SEASON", size = 4, fontface = "bold") +
+  annotate("text", x = 7, y = max(monthly_by_year$avg_load) * 0.98, 
+           label = "PRE", size = 3.5, fontface = "bold") +
+  annotate("text", x = 10.5, y = max(monthly_by_year$avg_load) * 0.98, 
+           label = "IN-SEASON", size = 3.5, fontface = "bold") +
+  labs(
+    title = "Monthly Training Load Progression (2023-2025)",
+    subtitle = "Year-over-year comparison | Note: May/June 2025 data limited to 2 midfielders",
+    x = "Month",
+    y = "Average Total Player Load",
+    caption = "Is progressive overload is occurring across seasons?"
+  ) +
+ theme_bw()
+```
+
+## Off/Pre Season Analysis Interpretation (ALL SESSIONS ARE INCLUDED)
+
+### 1) Outlier Distribution
+
+Off-Season (101 outliers):
+Moderate High: 60 (59% of off-season outliers)
+Critical High: 26 (26%)
+Extreme High: 15 (15%)
+Unusually Low: 0 
+
+Pre-Season (40 outliers):
+Moderate High: 21 (52%)
+Extreme High: 10 (25%)
+Critical High: 9 (23%)
+Unusually Low: 0 
+
+### 2) May/June Spike IS NOT a Team Thing
+
+May:
+Average load: 579
+Sessions: 26 (only 2 players)
+
+June:
+Average load: 727 (HIGHEST of entire year)
+Sessions: 21 (same 2 players)
+
+Compare to team-wide months:
+Jan-Apr: 376-405 load with 139-928 sessions
+Jul: 432 load with 542 sessions
+
+The May/June spike is NOT periodization, it's individual training
+
+The real off-season build is Jan-Apr:
+Consistent 376-405 load
+139-928 sessions per month (full team)
+Steady, sustainable progression
+
+
+### 3) Position By Month
+
+Defenders: 360-400
+Midfielders: 340-420
+Forwards: 280-400
+Similar loads across positions, so off-season is general fitness
+
+Except Goalkeepers!!!!!
+Flat 190-270 across all months
+Position-specific training year-round
+Don't follow periodization like field players
+
+May/June Anomaly:
+Purple line shoots to 720
+Other positions drop or plateau
+Confirms it's just 2 midfielders, not team strategy
+
+
+Pre-Season (July):
+All positions converge to 280-330
+Recovery from off-season peak (if there was one)
+Preparing for in-season microcycle structure
+Team training resumes
+
+
+In-Season (Aug-Nov):
+Positions diverge based on match demands
+
+Defenders highest (390-410)
+Midfielders similar (310-400)
+Forwards moderate (340-370)
+Goalkeepers lowest (180-220)
+
+This divergence matches the MD- analysis:
+
+In-season = position-specific tactical training (more position variance)
+Off-season = general fitness (less position variance)
+
+
+### 4) Actual Off Season Build (Jan-Apr)
+
+Off-Season Progression:
+Jan: 391 (post-holiday restart)
+Feb: 378 (slight dip - winter?)
+Mar: 405 (build)
+Apr: 376 (maintain)
+May: 579 (spike - but only 26 sessions, 2 players, can be ignored)
+
+Relatively flat, not progressive build
+Base maintenance: keeping fitness, not building dramatically
+Roster turnover: different players each month
+
+Pre-Season Pattern:
+May-June: 579 up to 727 (2 players only, can be ignored)
+June-July: 727 down to 432 (REAL taper begins)
+
+40% load reduction from June outlier to July team training
+Prepares for Aug in season start
+
+In-Season Pattern:
+Aug-Nov: 368-391 (stable, match-based periodization)
+Dec: 62 (season ends, holidays)
+
+### 5) Year to Year Comparison
+
+Three Strategies:
+
+2023:
+Steady off-season (310-400)
+High pre-season peak (July 440)
+High in-season loads (360-420 Aug-Nov)
+Continuous high volume
+
+2024:
+Consistent year-round (280-400 most months)
+Moderate all phases, no dramatic peaks
+Lower variability, most stable year
+
+2025:
+Individual May/June spike (580-720, 2 players, doesn't really count)
+Conservative in-season (240-280 Aug-Nov)
+Lowest in-season loads of all 3 years
+
+
+No Progressive Overload Across Years:
+Expected: 2025 > 2024 > 2023 at each month
+Actual: Lines cross repeatedly, and there is no clear progression
+
+Off-Season (Jan-Apr):
+2023 ≈ 2024 ≈ 2025 (all similar)
+
+In-Season (Aug-Nov):
+2025 is LOWEST (not highest)
+2023 > 2024 > 2025
+
+Not getting progressively fitter year-over-year. Different strategies each year, not progressive loading.
+
+### What's Actually Happening
+
+January-April (Off-Season):
+Team trains together
+General fitness maintenance
+~380-400 average load
+All positions train similarly
+100% participation (no low outliers)
+
+May-June (Summer Break):
+Most players OFF (no data except for two players)
+2 midfielders stay for individual work
+Not representative of team strategy, can't really use this
+
+July (Pre-Season):
+Team returns from break
+1-2 weeks moderate training (~432 load)
+Transition to in-season structure
+
+August-November (In-Season):
+Match-based periodization
+MD- microcycle structure
+Position-specific loads
+Strategic rest for starters
+
+December (Transition):
+Season ends
+Minimal training (62 average)
+Holiday break
+
+
+## Periodization Story
+
+Annual Phases (Macrocycle):
+Off-Season (Jan-Apr): Base maintenance at ~380-400 load
+Pre-Season (Jul): Brief transition at ~430 load
+In-Season (Aug-Nov): Competition at ~370-390 load
+NOTE: Loads are similar across phases. Matches dictate intensity, not training volume
+
+Monthly Phases:
+Off-season: Stable month to month (370-410)
+In-season: Stable week to week (microcycles repeat)
+
+Microcycle (Weekly, In Season Only):
+MD-6 to MD-5 (build) to MD-4 (build) to MD-3 (peak) to MD-2/MD-1 (taper)
+Position-specific,
+Only exists during the season
+
+
+
+
+
+# 7 Player Analysis
+
+Now I'll check for players who were present for all 3 years. 
+
+First, I'll add year to catapult data
+```{r}
+catapult_with_year <- catapult_all_phases %>%
+  mutate(year = year(Date))
+```
+
+
+Next, I'll find players with data in all 3 years
+```{r}
+players_by_year <- catapult_with_year %>%
+  group_by(`Player ID`, year) %>%
+  summarise(n_sessions = n(), .groups = "drop") %>%
+  filter(year %in% c(2023, 2024, 2025))
+```
+
+
+Now I'll count how many years each player appears in
+```{r}
+player_year_counts <- players_by_year %>%
+  group_by(`Player ID`) %>%
+  summarise(
+    years_present = n_distinct(year),
+    years = paste(sort(unique(year)), collapse = ", "),
+    total_sessions = sum(n_sessions),
+    .groups = "drop"
+  )
+```
+
+Now I'll filter for players with 3 years of data
+
+```{r}
+three_year_players <- player_year_counts %>%
+  filter(years_present == 3) %>%
+  pull(`Player ID`)
+
+glimpse(three_year_players)
+
+```
+
+There are 7 total players with data in all 3 years. 
+
+```{r}
+three_year_cohort_summary <- player_year_counts %>%
+  filter(years_present == 3) %>%
+  arrange(desc(total_sessions))
+
+print(three_year_cohort_summary)
+
+```
+We have a good amount of total sessions, enough to do a good analysis on these specific players
+
+
+Let's check which positions these players are
+```{r}
+three_year_with_positions <- catapult_with_year %>%
+  filter(`Player ID` %in% three_year_players) %>%
+  group_by(`Player ID`) %>%
+  summarise(
+    Position = first(Position),
+    years = paste(sort(unique(year)), collapse = ", "),
+    total_sessions = n(),
+    .groups = "drop"
+  )
+
+print(three_year_with_positions)
+```
+We have 2 forwards, 1 midfielder, 3 defenders, and 1 keeper
+
+Now we'll filter the dataset to only 3-year players. I also am getting rid of December data, since there are only 5 december sessions and that might skew the in season data negatively 
+```{r}
+cohort_data <- catapult_with_year %>%
+  mutate(month_num = month(Date)) %>%
+  filter(`Player ID` %in% three_year_players, month_num != 12) 
+```
+
+
+Now we can look at the monthly progression for 3-year cohort only
+```{r}
+cohort_monthly <- cohort_data %>%
+  filter(!is.na(`Total Player Load`), `Total Player Load` > 0) %>%
+  mutate(
+    month_num = month(Date),
+    month_name = month(Date, label = TRUE, abbr = TRUE)
+  ) %>%
+  group_by(year, month_num, month_name, season_phase) %>%
+  summarise(
+    avg_load = mean(`Total Player Load`, na.rm = TRUE),
+    n_sessions = n(),
+    n_players = n_distinct(`Player ID`),
+    .groups = "drop"
+  ) %>%
+  arrange(year, month_num)
+
+print(cohort_monthly)
+```
+Now we can look at year over year progression
+
+```{r}
+cohort_yoy <- cohort_data %>%
+  filter(!is.na(`Total Player Load`), `Total Player Load` > 0) %>%
+  mutate(month_num = month(Date)) %>%
+  group_by(year, month_num) %>%
+  summarise(
+    avg_load = mean(`Total Player Load`, na.rm = TRUE),
+    n_sessions = n(),
+    .groups = "drop"
+  )
+
+print(cohort_yoy)
+```
+
+
+
+
+Now we can visualize the year over year progression
+
+```{r}
+ggplot(cohort_yoy, aes(x = factor(month_num, levels = 1:11), y = avg_load, 
+                       color = factor(year), group = year)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  geom_vline(xintercept = 6, linetype = "dashed", linewidth = 0.8) +
+  geom_vline(xintercept = 8, linetype = "dashed", linewidth = 0.8) +
+  annotate("rect", xmin = 0.5, xmax = 6, ymin = -Inf, ymax = Inf, 
+           alpha = 0.05, fill = "lightblue") +
+  annotate("rect", xmin = 6, xmax = 8, ymin = -Inf, ymax = Inf, 
+           alpha = 0.05, fill = "orange") +
+  annotate("rect", xmin = 8, xmax = 12.5, ymin = -Inf, ymax = Inf, 
+           alpha = 0.05, fill = "darkred") +
+  annotate("text", x = 3.5, y = max(monthly_with_phase$mean_load) * 0.98, 
+           label = "OFF-SEASON", size = 4, fontface = "bold", color = "steelblue") +
+  annotate("text", x = 7, y = max(monthly_with_phase$mean_load) * 0.98, 
+           label = "PRE", size = 4, fontface = "bold", color = "orange") +
+  annotate("text", x = 10.5, y = max(monthly_with_phase$mean_load) * 0.98, 
+           label = "IN-SEASON", size = 4, fontface = "bold", color = "darkred") +
+  scale_x_discrete(labels = month.abb) +
+  scale_color_manual(values = c("2023" = "#E63946", "2024" = "#457B9D", "2025" = "#2A9D8F"),
+                     name = "Year") +
+  labs(
+    title = "3-Year Player Periodization Pattern",
+    subtitle = "Only players present in all 3 seasons (7 players) | No Dec data",
+    x = "Month",
+    y = "Average Total Player Load"
+  ) +
+  theme_bw()
+```
+
+It does not look like the year over year progression is increasing. We can officially confirm this with the data here
+
+```{r}
+cohort_annual_baseline <- cohort_data %>%
+  filter(!is.na(`Total Player Load`), `Total Player Load` > 0) %>%
+  mutate(month_num = month(Date)) %>%
+  filter(month_num %in% c(1:4, 8:11)) %>%  # Off-season start and in-season
+  group_by(year) %>%
+  summarise(
+    avg_load = mean(`Total Player Load`, na.rm = TRUE),
+    n_sessions = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(year)
+
+print(cohort_annual_baseline)
+```
+
+
+Now we can check by phases
+```{r}
+cohort_phase_comparison_all <- cohort_data %>%
+  filter(!is.na(`Total Player Load`), `Total Player Load` > 0) %>%
+  group_by(year, season_phase) %>%
+  summarise(
+    avg_load = mean(`Total Player Load`, na.rm = TRUE),
+    n_sessions = n(),
+    n_players = n_distinct(`Player ID`),
+    .groups = "drop"
+  ) %>%
+  arrange(year, season_phase)
+
+print(cohort_phase_comparison_all)
+```
+
+Reorder 
+```{r}
+cohort_phase_comparison_all <- cohort_phase_comparison_all %>%
+mutate(season_phase = factor(season_phase, levels = c("Off-Season", "Pre-Season", "In-Season")))
+```
+
+
+
+And visualize
+
+```{r}
+ggplot(cohort_phase_comparison_all, aes(x = factor(year), y = avg_load, 
+                                         fill = season_phase)) +
+  geom_col(position = "dodge") +
+  geom_text(aes(label = round(avg_load, 0)), 
+            position = position_dodge(width = 0.9), 
+            vjust = -0.5, size = 3.5) +
+  scale_fill_manual(values = c(
+    "Off-Season" = "lightblue", 
+    "Pre-Season" = "orange",
+    "In-Season" = "darkred"
+  )) +
+  labs(
+    title = "Training Load by Season Phase: 3-Year Cohort",
+    subtitle = "Off-Season (Jan-May) | Pre-Season (Jun-Jul) | In-Season (Aug-Nov)",
+    x = "Year",
+    y = "Average Total Player Load",
+    fill = "Season Phase", 
+    caption = "Note: Minimal December Data (n=5 sessions), so December data excluded"
+  ) +
+  theme_bw() +
+  theme(legend.position = "bottom")
+```
+
+Now we can test for progressive overload
+```{r}
+progressive_overload_test <- cohort_annual_baseline %>%
+  summarise(
+    load_2023 = avg_load[year == 2023],
+    load_2024 = avg_load[year == 2024],
+    load_2025 = avg_load[year == 2025],
+    change_2023_to_2024 = load_2024 - load_2023,
+    change_2024_to_2025 = load_2025 - load_2024,
+    pct_change_2023_to_2024 = 100 * (load_2024 - load_2023) / load_2023,
+    pct_change_2024_to_2025 = 100 * (load_2025 - load_2024) / load_2024,
+    progressive_overload = (load_2024 > load_2023) & (load_2025 > load_2024)
+  )
+
+print(progressive_overload_test)
+```
+We can even go deeper and look at individual player trajectories
+
+```{r}
+player_trajectories <- cohort_data %>%
+  filter(!is.na(`Total Player Load`), `Total Player Load` > 0) %>%
+  group_by(`Player ID`, year) %>%
+  summarise(avg_annual_load = mean(`Total Player Load`, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = year, values_from = avg_annual_load, names_prefix = "year_") %>%
+  mutate(
+    # calculate changes
+    change_2023_to_2024 = year_2024 - year_2023,
+    change_2024_to_2025 = year_2025 - year_2024,
+    
+    # Determine if improving
+    improving = !is.na(year_2023) & !is.na(year_2024) & !is.na(year_2025) &
+                (year_2024 > year_2023) & (year_2025 > year_2024),
+    
+    # classify trend
+    trend = case_when(
+      is.na(year_2023) | is.na(year_2024) | is.na(year_2025) ~ "Incomplete Data",
+      (year_2024 > year_2023) & (year_2025 > year_2024) ~ "Increasing",
+      (year_2024 < year_2023) & (year_2025 < year_2024) ~ "Decreasing",
+      TRUE ~ "Variable Progression"
+    )
+  )
+
+print(player_trajectories)
+```
+
+
+Now we can summarize the trends of the 7 players
+```{r}
+# Summary of trends
+trend_summary <- player_trajectories %>%
+  group_by(trend) %>%
+  summarise(n_players = n(), .groups = "drop") %>%
+  mutate(percentage = 100 * n_players / sum(n_players))
+
+print(trend_summary)
+```
+
+# 3 Year 7 Player Cohort Analysis
+
+Cohort is defined as players who were present for all 3 years of data that we have
+
+
+### Individual Player Progressions
+
+4 players (57%): "Increasing" - consistent improvement each year
+3 players (43%): "Variable" - improved one year, declined the next
+0 players (0%): "Decreasing" - no players got worse each year
+
+This means that the majority of players show linear progressive overload. The remaining 43% have mixed patterns but still contribute to team-level improvement. No players regressed consistently, as "variable progression" players ended 2025 higher than 2023 (except for one, who ended basically the same. This is the goalkeeper)
+
+
+### Annual Baseline Loads (Team Average):
+
+2023: 245 average load
+2024: 293 average load | +48 
+2025: 312 average load | +19 | +67  from 2023
+
+Progressive Overload Test Result: TRUE
+Individual Contributions:
+Average improvement across all 7 players: +60 load 
+Range: -1 to +135 (massive improvement)
+6 out of 7 players (86%) improved overall from 2023 to 2025
+
+
+### Phase Breakdown
+
+2023:
+In-Season: 231, Off-Season: 393, Pre-Season: 438
+4/7 players made huge 2023→2024 jumps, so the aggressive loading worked
+
+2024:
+In-Season: 288 (+25%), Off-Season: 309, Pre-Season: 304
+More balanced loading, continued team improvement, 2 players dipped in 2024, but 5 improved
+
+2025:
+In-Season: 321 (+39% from 2023!) | Off-Season: 299 | Pre-Season: 213 (taper)
+Peak performance, 3 players declined slightly from 2024 peak, but 4 kept improving
+
+
+### Interpretation
+
+Progressive Overload? YES
+
+Team: 245 to 293 to 312 
+
+Individual: 6/7 players improved (86%), average +60 load 
+
+
+57% linear improvement, 43% variable is excellent
+
+86% net improvement despite individual fluctuations
+
+Even "variable progression" players contribute to team gains
+
+
+# How Does This Connect to the Previous Two Analysis?
+
+### FULL DATASET (All 54 Players, All Years): 
+
+Jan-Apr: Stable ~370-410 load
+
+May-Jun: Spike to 570-720 (only 2 players, not representative)
+
+Jul (Pre-Season): Drop to 432
+
+Aug-Dec (In-Season): 170-350 (variable, no clear progression)
+
+Year-over-Year (2023 vs 2024 vs 2025):
+NO consistent progressive overload
+2025 shows a different pattern, not higher
+Lines cross repeatedly, and there is no clear "each year starts higher"
+
+### 3-YEAR COHORT (7 Players In All 3 Years):
+
+Off-Season: 2023: 393 to 2024: 309 to 2025: 299
+Pre-Season: 2023: 438 to 2024: 304 to 2025: 213 (clear evolution toward taper)
+In-Season: 2023: 231 to 2024: 288 to 2025: 321 
+
+Year-over-Year:
+We have CLEAR progressive overload: 245 to 293 to 312 
+In-season loads increase each year: 231 to 288 to 321 
+
+Clear progressive overload exists when we control for roster consistency.
+
+### Why Do We See The Differences?
+
+1. Different players each year:
+
+Players graduate after 2023
+New players arrive in 2024/2025
+Transfers in and out
+We aren't comparing the same athletes every year
+
+May/June data contamination:
+May/June average = 720 (only 2 midfielders training)
+This inflates the off-season average artificially
+Makes it look like 2025 had higher off-season loads, but it's just 2 players, so we have to discount that
+
+# Final Overall Connections Between The Three Analysis
+
+
+The periodization analysis across the three phases shows validated progressive overload with an interesting evolution in application. 
+
+At the microcycle level, which is only used during in-season competition (Aug-Dec), weekly load management follows normal MD- structure with MD-5 peak training days (410-455 load), MD-3 match preparation (430-461 for defenders), and MD-1 tapers (280-307). This consistent weekly structure is maintained across all three seasons. 
+
+
+At the monthly level, seasonal phases (off-season 299-393, pre-season 213-438, in-season 231-321) structure the annual training cycle, but the 7-player cohort analysis reveals that pre season preparation strategy evolved across the three years: 
+
+2023 had aggressive pre-season cycling (June taper to 140, July ramp to 400, +186%) but produced the lowest in-season training capacity. 
+
+2024 moderated the approach (+60% pre-season ramp, 288 in-season load) 
+
+2025 minimized pre-season ramp up (+38%) to achieve the highest in-season load tolerance (321 average). 
+
+
+
+At the macrocycle level, this strategic change across pre-season approaches while maintaining consistent in season microcycle structure allowed for a 27% baseline progression (245 to 312) and 39% in-season load capacity improvement (231 to 321) over three years, with 86% of the 7 player cohort showing positive growth despite 43% showing non-linear trajectories. The inverse relationship between pre season ramp magnitude and in-season load capacity (186% ramp, 231 load vs. 38% ramp, 321 load) suggests that periodization in this context needs consistent microcycle execution during competition while minimizing monthly variability during prep phases. This shows that consistency and progression across the macrocycle may be more important than taper-rebuild strategies when trying to maximize training capacity across an entire competitive season.
+
+#___________________________________________________________________________________________________________________________
+
+# Velocity Zone Optimization Analysis
+
+
+Clean up the data, get it ready for velocity zone analysis
+```{r}
+velocity_zone_catapult <- catapult_fixed %>%
+  mutate(
+    # merge all defender positions
+    Position = case_when(
+      position_name %in% c("Center Back", "Outside Back", "Defender") ~ "Defender",
+      TRUE ~ position_name
+    )
+  ) %>%
+  filter(
+    !is.na(date),
+    !is.na(maximum_velocity),
+    maximum_velocity > 0,
+    !is.na(Position)
+  )
+```
+
+
+Now we need to find and validate matches in the data. First we'll check match period indicators, then cross reference that with the schedule data we have. We will use a 1 day tolerance in case there are differences. 
+```{r}
+#indicators
+match_periods <- c("1st Half", "2nd Half", "1st Half 1", "2nd Half 1", "OT 1", "OT 2")
+
+# cross-reference
+catapult_match_dates <- catapult_fixed %>%
+  filter(period_name %in% match_periods) %>%
+  distinct(date) %>%
+  arrange(date) %>%
+  mutate(in_catapult = TRUE)
+
+# check alignment with schedule (+ or - 1 day tolerance for possible differences)
+schedule_dates_only <- full_schedule$game_date
+
+date_alignment_check <- catapult_match_dates %>%
+  rowwise() %>%
+  mutate(
+    days_to_nearest_scheduled_match = min(abs(as.numeric(difftime(date, schedule_dates_only, units = "days")))),
+    alignment_status = case_when(
+      days_to_nearest_scheduled_match == 0 ~ "Exact match",
+      days_to_nearest_scheduled_match == 1 ~ "Off by 1 day",
+      TRUE ~ "No nearby match"
+    )
+  )
+
+
+print(table(date_alignment_check$alignment_status))
+
+# use dates within 1-day tolerance for validated matches
+dates_within_1_day <- date_alignment_check %>%
+  filter(days_to_nearest_scheduled_match <= 1) %>%
+  pull(date)
+
+# create validated match dataset
+validated_match_data <- velocity_zone_catapult %>%
+  filter(
+    period_name %in% match_periods,
+    date %in% dates_within_1_day,
+    maximum_velocity <= 23,  # Remove GPS errors
+    maximum_velocity > 0
+  )
+
+print(paste("Validated match observations:", nrow(validated_match_data)))
+print(paste("Number of match dates:", n_distinct(validated_match_data$date)))
+
+```
+
+We were able to get 67 out of 70 games. That's pretty good. 
+
+
+Now we can look at our match based player max velocities
+
+```{r}
+player_max_velocities_match <- validated_match_data %>%
+  group_by(player_id, Position) %>%
+  summarise(
+    match_max = max(maximum_velocity, na.rm = TRUE),
+    n_matches = n_distinct(date),
+    .groups = "drop"
+  ) %>%
+  filter(is.finite(match_max), match_max > 0)
+
+print(head(player_max_velocities_match, 20))
+```
+
+Now we can look at position based stats
+```{r}
+position_velo_stats <- player_max_velocities_match %>%
+  group_by(Position) %>%
+  summarise(
+    n_players = n(),
+    mean_max_velos = mean(match_max),
+    sd_max_velos = sd(match_max),
+    median_max_velos = median(match_max),
+    percentile_70 = quantile(match_max, 0.70),
+    percentile_90 = quantile(match_max, 0.90),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(median_max_velos))
+
+print(position_velo_stats)
+```
+
+
+
+
+We can now analyze the current velocity band usage across positions to understand existing training distribution.
+```{r}
+velocity_bands <- velocity_zone_catapult %>%
+  group_by(Position) %>%
+  summarise(
+    n_sessions = n(),
+    
+    # Average distance per session in each band
+    band1_avg = mean(velocity_band_1_total_distance_set_2, na.rm = TRUE),
+    band2_avg = mean(velocity_band_2_total_distance_set_2, na.rm = TRUE),
+    band3_avg = mean(velocity_band_3_total_distance_set_2, na.rm = TRUE),
+    band4_avg = mean(velocity_band_4_total_distance_set_2, na.rm = TRUE),
+    
+    # Percentage of total distance
+    band1_pct = mean(velocity_band_1_distance_set_2, na.rm = TRUE),
+    band2_pct = mean(velocity_band_2_distance_set_2, na.rm = TRUE),
+    band3_pct = mean(velocity_band_3_distance_set_2, na.rm = TRUE),
+    band4_pct = mean(velocity_band_4_distance_set_2, na.rm = TRUE),
+    
+    .groups = "drop"
+  )
+```
+
+
+Visualize the current velocity band distribution to see how training load is distributed across speed zones.
+```{r}
+bands_for_plot <- velocity_bands %>%
+  select(Position, band1_pct, band2_pct, band3_pct, band4_pct) %>%
+  pivot_longer(cols = starts_with("band"), names_to = "band", values_to = "percentage") %>%
+  mutate(band = factor(band, 
+                       levels = c("band1_pct", "band2_pct", "band3_pct", "band4_pct"),
+                       labels = c("Band 1 (0-9.6 MPH)", "Band 2 (9.6-12 MPH)", 
+                                 "Band 3 (12-14.4 MPH)", "Band 4 (14.4+ MPH)")))
+
+ggplot(bands_for_plot, aes(x = percentage, y = Position, fill = band)) +
+  geom_col(position = "stack") +
+  geom_text(aes(label = ifelse(percentage >= 3, paste0(round(percentage, 1), "%"), "")),
+            position = position_stack(vjust = 0.5), 
+            size = 3, color = "white") +
+  scale_x_continuous(
+    breaks = seq(0, 100, by = 5),
+    expand = c(0, 0)
+  ) +
+  labs(
+    title = "Velocity Band Usage by Position (2023-2025)",
+    x = "Percentage of Total Distance (%)",
+    y = "Position",
+    fill = "Velocity Band"
+  ) +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank())
+```
+
+Training load is very heavily skewed toward low-intensity work. Band 1 (0-9.6 MPH) accounts for 75.6 - 91.2% of total distance across the four positions, while high-intensity work (Bands 3+4, >12 MPH) represents only 2 - 3% of total distance. This distribution suggests minimal exposure to game speed demands during training.
+
+
+
+Now I need to figure out what the sweet spots are for CU's athletes. I'll first create position-specific velocity thresholds using the distribution of each position's max match velocities. I will use 70th and 90th percentiles as cutoffs for high speed and sprint work. 
+
+```{r}
+position_thresholds <- position_velo_stats %>%
+  mutate(
+    high_speed_threshold = percentile_70,  # 70th percentile of match max velocities
+    sprint_threshold = percentile_90       # 90th percentile of match max velocities
+  ) %>%
+  select(Position, high_speed_threshold, sprint_threshold, 
+         mean_max_velos, median_max_velos, n_players)
+
+print(position_thresholds)
+```
+
+Match based position specific thresholds show minimal variation across positions with the exception of goalkeeper. High-speed thresholds (70th percentile) range from 15 MPH (Goal Keeper) to 17.8 MPH (Middie), a difference of only 2.8 MPH. Sprint thresholds (90th percentile) range from 15.9 MPH (Keeper) to 19 MPH (Forward), a difference of 3.1 MPH. This is absolutely significant, and makes sense, as keepers are going to be running less during games. 
+
+
+
+We can now look at error types and how arbitrary thresholds misclassify players in terms of high speed and sprint work
+```{r}
+player_max_velocities_all <- velocity_zone_catapult %>%
+  filter(maximum_velocity <= 20) %>%
+  group_by(player_id, Position) %>%
+  summarise(
+    all_time_max = max(maximum_velocity, na.rm = TRUE),
+    n_sessions = n(),
+    .groups = "drop"
+  ) %>%
+  filter(is.finite(all_time_max), all_time_max > 0)
+```
+
+
+```{r}
+player_classification <- player_max_velocities_all %>%
+  left_join(position_thresholds %>% 
+              select(Position, high_speed_threshold, sprint_threshold), 
+            by = "Position") %>%
+  mutate(
+    # ARBITRARY THRESHOLDS based on individual all-time max
+    arbitrary_hs = all_time_max * 0.70,
+    arbitrary_sprint = all_time_max * 0.90,
+    
+    # Match-based position-specific thresholds (percentile-based)
+    meets_hs_pos = all_time_max >= high_speed_threshold,
+    meets_sprint_pos = all_time_max >= sprint_threshold,
+    
+    # Arbitrary thresholds (% of individual max)
+    meets_hs_arb = all_time_max >= arbitrary_hs,
+    meets_sprint_arb = all_time_max >= arbitrary_sprint,
+    
+    # Mismatches
+    hs_mismatch = meets_hs_pos != meets_hs_arb,
+    sprint_mismatch = meets_sprint_pos != meets_sprint_arb,
+    
+    # Error types
+    hs_false_pos = !meets_hs_pos & meets_hs_arb,
+    hs_false_neg = meets_hs_pos & !meets_hs_arb,
+    sprint_false_pos = !meets_sprint_pos & meets_sprint_arb,
+    sprint_false_neg = meets_sprint_pos & !meets_sprint_arb
+  )
+```
+
+
+
+Now we can compare
+```{r}
+threshold_comparison <- player_classification %>%
+  group_by(Position) %>%
+  summarise(
+    n_players = n(),
+    # Match-based position-specific (percentile)
+    high_speed_threshold = first(high_speed_threshold),
+    sprint_threshold = first(sprint_threshold),
+    # Arbitrary (average of individual 70%/90%)
+    arbitrary_hs_avg = mean(arbitrary_hs),
+    arbitrary_sprint_avg = mean(arbitrary_sprint),
+    # Differences
+    diff_high_speed = high_speed_threshold - arbitrary_hs_avg,
+    diff_sprint = sprint_threshold - arbitrary_sprint_avg,
+    .groups = "drop"
+  )
+
+print(threshold_comparison)
+```
+
+
+Get the data that we'll use for plotting and reshape
+```{r}
+threshold_plot_data <- threshold_comparison %>%
+  select(Position, 
+         `Match-Based Position-Specific (70th %ile)` = high_speed_threshold,
+         `Arbitrary (70% of all-time max)` = arbitrary_hs_avg,
+         `Match-Based Position-Specific (90th %ile)` = sprint_threshold,
+         `Arbitrary (90% of all-time max)` = arbitrary_sprint_avg) %>%
+  pivot_longer(cols = -Position, names_to = "Method", values_to = "Velocity_MPH")
+```
+
+
+Plot thresholds
+```{r}
+ggplot(threshold_plot_data, aes(x = Position, y = Velocity_MPH, fill = Method)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c(
+    "Match-Based Position-Specific (70th %ile)" = "forestgreen",
+    "Arbitrary (70% of all-time max)" = "orange",
+    "Match-Based Position-Specific (90th %ile)" = "steelblue",
+    "Arbitrary (90% of all-time max)" = "darkred"
+  )) +
+  labs(
+    title = "Match-Based Position-Specific vs Arbitrary Velocity Thresholds",
+    subtitle = "Competition-based percentiles vs 70%/90% of each player's all-time max",
+    x = "Position",
+    y = "Velocity Threshold (MPH)",
+    fill = "Threshold Method"
+  ) +
+  theme_bw() +
+  theme(legend.position = "bottom")
+```
+
+
+Match based position-specific percentile thresholds (green/blue) are substantially higher than arbitrary percentage-based thresholds (orange/red). On average, position-specific high-speed thresholds are ~3 to 5 MPH higher than arbitrary 70% of max thresholds, and sprint thresholds are ~0.5 to 2 MPH higher than arbitrary 90%-of-max thresholds. The arbitrary approach sets standards too low because 70% and 90% of a player's all-time max velocity are values that they usually achieve. 
+
+
+I want to know if the differences in match based position specific thresholds are statistically significant. For that, we can do an ANOVA test. 
+
+
+First, assumptions check:
+
+normally distributed?
+```{r}
+player_max_velocities_match %>%
+  group_by(Position) %>%
+  summarise(shapiro_p = shapiro.test(match_max)$p.value, .groups = "drop")
+```
+This checks out, as p > 0.05 for all positions
+
+Next, equal variance
+
+```{r}
+library(car)
+leveneTest(match_max ~ Position, data = player_max_velocities_match)
+```
+Since p=0.04759 < 0.05, assumption is NOT met. However, this does not completely screw up the ANOVA. This is a borderline violation. I will check the variance ratio
+
+```{r}
+variance_check <- player_max_velocities_match %>%
+  group_by(Position) %>%
+  summarise(
+    n = n(),
+    variance = var(match_max),
+    sd = sd(match_max),
+    .groups = "drop"
+  )
+
+variance_ratio <- max(variance_check$variance) / min(variance_check$variance)
+
+print("Variance Check")
+print(variance_check)
+print(paste("Variance ratio (max/min):", round(variance_ratio, 2)))
+```
+Our variance ratio is 8.41. Yikes. Because of this, I will try 3 different tests. A regular anova test, a welches anova (doesn't include equal variance as an assumption), and aa Kruskal-Wallis test, which is non parametric. If all tests agree, the variance is not an issue. 
+
+```{r}
+# Regular ANOVA
+regular_anova <- aov(match_max ~ Position, data = player_max_velocities_match)
+regular_summary <- summary(regular_anova)
+print("\n=== REGULAR ANOVA ===")
+print(regular_summary)
+
+# Welch's ANOVA (doesn't assume equal variances)
+welch_anova <- oneway.test(match_max ~ Position, data = player_max_velocities_match)
+print("\n=== WELCH'S ANOVA (Robust to unequal variances) ===")
+print(welch_anova)
+
+# Kruskal-Wallis (non-parametric)
+kruskal_test <- kruskal.test(match_max ~ Position, data = player_max_velocities_match)
+print("\n=== KRUSKAL-WALLIS (Non-parametric) ===")
+print(kruskal_test)
+
+# Compare p-values
+comparison <- data.frame(
+  Test = c("Regular ANOVA", "Welch's ANOVA", "Kruskal-Wallis"),
+  P_Value = c(
+    regular_summary[[1]]["Position", "Pr(>F)"],
+    welch_anova$p.value,
+    kruskal_test$p.value
+  ),
+  Significant = c(
+    regular_summary[[1]]["Position", "Pr(>F)"] < 0.05,
+    welch_anova$p.value < 0.05,
+    kruskal_test$p.value < 0.05
+  )
+)
+
+print("\n=== P-VALUE COMPARISON ===")
+print(comparison)
+```
+
+Position differences in match maximum velocity were marginally non-significant using Welch's ANOVA (p = 0.056), but the Kruskal-Wallis test on medians was significant (p = 0.016). Despite this, we will still implement match-based position-specific thresholds based on three reasons: 
+
+(1) practical differences in positional match demands
+(2) group sponsor's recommendation to complement zones already implemented 
+(3) better utility for load monitoring. 
+
+
+
+We can visualize differences in positional max velocities using a bar chart. I have to group by position summarize the mean and standard errors first
+```{r}
+boxplot_summary <- player_max_velocities_match %>%
+  group_by(Position) %>%
+  summarise(
+    mean_max = mean(match_max),
+    se = sd(match_max) / sqrt(n()),
+    .groups = "drop"
+  )
+
+ggplot(boxplot_summary, aes(x = Position, y = mean_max, fill = Position)) +
+  geom_col(alpha = 0.7) +
+  geom_errorbar(aes(ymin = mean_max - se, ymax = mean_max + se), 
+                width = 0.2, linewidth = 1) +
+  geom_text(aes(label = round(mean_max, 1)), 
+            vjust = -0.5, size = 5, fontface = "bold") +
+  labs(
+    title = "Do Players Show Position-Specific Velocity Profiles in Matches?",
+    subtitle = "Mean match maximum velocity ± standard error by position",
+    x = "Position",
+    y = "Mean Match Maximum Velocity (MPH)"
+  ) +
+  ylim(0, 22) +
+  theme_bw() +
+  theme(legend.position = "none")
+```
+
+
+
+Now we can summarize all the velocity stats by position
+```{r}
+position_summary <- position_velo_stats %>%
+  select(Position, n_players, mean_max_velos, sd_max_velos, 
+         median_max_velos, percentile_70, percentile_90) %>%
+  arrange(desc(mean_max_velos))
+
+print(position_summary)
+```
+
+Now let's see what the gaps between arbitrary thresholds and actual thresholds would be
+```{r}
+gap_analysis <- threshold_comparison %>%
+  mutate(
+    gap_70_mph = high_speed_threshold - arbitrary_hs_avg,
+    gap_90_mph = sprint_threshold - arbitrary_sprint_avg,
+    gap_70_pct = 100 * gap_70_mph / arbitrary_hs_avg,
+    gap_90_pct = 100 * gap_90_mph / arbitrary_sprint_avg
+  ) %>%
+  select(Position, 
+         arbitrary_hs_avg, high_speed_threshold, gap_70_mph, gap_70_pct,
+         arbitrary_sprint_avg, sprint_threshold, gap_90_mph, gap_90_pct)
+
+print(gap_analysis)
+
+```
+
+Lets summarize these
+```{r}
+gap_summary <- gap_analysis %>%
+  summarise(
+    avg_gap_70th_mph = mean(gap_70_mph),
+    avg_gap_70th_pct = mean(gap_70_pct),
+    avg_gap_90th_mph = mean(gap_90_mph),
+    avg_gap_90th_pct = mean(gap_90_pct),
+    min_gap_70 = min(gap_70_mph),
+    max_gap_70 = max(gap_70_mph),
+    min_gap_90 = min(gap_90_mph),
+    max_gap_90 = max(gap_90_mph)
+  )
+
+print(gap_summary)
+```
+
+
+
+
+
+Now we can visualize the absolute gaps. First, I'll reshape the data
+```{r}
+gap_plot_long <- gap_analysis %>%
+  select(Position, `High-Speed (70th)` = gap_70_mph, `Sprint (90th)` = gap_90_mph) %>%
+  pivot_longer(cols = -Position, names_to = "Threshold", values_to = "Gap_MPH")
+```
+
+Now visualize
+```{r}
+ggplot(gap_plot_long, aes(x = Position, y = Gap_MPH, fill = Threshold)) +
+  geom_col(position = "dodge", width = 0.7) +
+  geom_text(aes(label = paste0("+", round(Gap_MPH, 1), " MPH")), 
+            position = position_dodge(width = 0.7), 
+            vjust = -0.2, size = 3.5) +
+  scale_fill_manual(values = c("High-Speed (70th)" = "forestgreen", "Sprint (90th)" = "steelblue")) +
+  labs(
+    title = "How Much Faster Are Match-Based Position-Specific Thresholds?",
+    subtitle = "Absolute difference (MPH) between match-based percentiles and arbitrary % of max",
+    x = "Position",
+    y = "Gap (MPH)",
+    fill = "Threshold Type"
+  ) +
+  theme_bw() +
+  theme(legend.position = "bottom")
+```
+
+Match based position-specific thresholds are higher than arbitrary thresholds across all positions. For high-speed (70th percentile), position-specific cutoffs are 3 to 5.2 MPH higher than arbitrary 70%-of-max thresholds. For sprint (90th percentile), position-specific cutoffs are 0.6 to 2.1 MPH higher than arbitrary 90%-of-max thresholds. Midfielders show the largest gaps (+5.2 MPH high-speed, +2.1 MPH sprint), while Keepers show the smallest gaps (+3 MPH high-speed, +0.5 MPH sprint). These gaps demonstrate that arbitrary percentage based thresholds absolutely underestimate high-speed and sprint capabilities.
+
+
+
+We can also do this by percentages. First, reshape
+```{r}
+gap_pct_plot <- gap_analysis %>%
+  select(Position, `70th Percentile` = gap_70_pct, `90th Percentile` = gap_90_pct) %>%
+  pivot_longer(cols = -Position, names_to = "Threshold", values_to = "Gap_Pct")
+```
+
+Then visualize
+```{r}
+ggplot(gap_pct_plot, aes(x = Position, y = Gap_Pct, fill = Threshold)) +
+  geom_col(position = "dodge") +
+  geom_text(aes(label = paste0("+", round(Gap_Pct, 0), "%")), 
+            position = position_dodge(width = 0.9), 
+            vjust = -0.2, size = 3.5) +
+  labs(
+    title = "Percentage Increase with Match-Based Position-Specific Thresholds",
+    subtitle = "% higher than arbitrary 70%/90% of all-time max",
+    x = "Position",
+    y = "Percentage Increase (%)",
+    fill = "Percentile"
+  ) +
+  theme_bw() +
+  theme(legend.position = "bottom")
+```
+
+Match based position specific thresholds are 25-42% higher for high-speed work (70th percentile) and 4-14% higher for sprint work (90th percentile) compared to arbitrary percentage-based thresholds. Midfielders, once again, show the largest percentage increases (+42% high-speed, +14% sprint), while Keepers (again) show the smallest (+25% high-speed, +4% sprint). The consistent percentage increases over all positions show that using 70% and 90% of a player's all-time max velocity sets standards below what is actually needed to identify high speed and sprint work.
+
+
+
+
+
+
+Now we can figure out how many players would be misclassified. First by position
+```{r}
+misclass_by_position <- player_classification %>%
+  group_by(Position) %>%
+  summarise(
+    n_players = n(),
+    hs_misclassified = sum(hs_mismatch),
+    hs_false_positive = sum(hs_false_pos),
+    hs_false_negative = sum(hs_false_neg),
+    sprint_misclassified = sum(sprint_mismatch),
+    sprint_false_positive = sum(sprint_false_pos),
+    sprint_false_negative = sum(sprint_false_neg),
+    hs_error_rate = 100 * hs_misclassified / n_players,
+    sprint_error_rate = 100 * sprint_misclassified / n_players,
+    .groups = "drop"
+  )
+
+print(misclass_by_position)
+
+```
+
+Now overall
+
+```{r}
+overall_misclass <- player_classification %>%
+  summarise(
+    total_players = n(),
+    hs_misclassified = sum(hs_mismatch),
+    hs_error_rate = 100 * hs_misclassified / total_players,
+    sprint_misclassified = sum(sprint_mismatch),
+    sprint_error_rate = 100 * sprint_misclassified / total_players,
+    total_misclassified = sum(hs_mismatch | sprint_mismatch),
+    total_error_rate = 100 * total_misclassified / total_players
+  )
+
+print(overall_misclass)
+```
+We have a pretty high misclassification rate, at 27.8 percent for high speed work and 50 percent for sprint work
+
+
+And we can visualize these misclassification rates
+
+```{r}
+ggplot(misclass_by_position, aes(x = Position, y = hs_error_rate, fill = Position)) +
+  geom_col() +
+  geom_text(aes(label = paste0(round(hs_error_rate, 1), "%\n(", hs_misclassified, " players)")), 
+            vjust = -0.2, size = 3.5) +
+  labs(
+    title = "How Many Players Would Be Misclassified?",
+    subtitle = "High-speed capability (match-based 70th percentile) error rate by position",
+    x = "Position",
+    y = "Misclassification Rate (%)",
+    fill = "Position"
+  ) +
+  scale_y_continuous(limits = c(0, max(misclass_by_position$hs_error_rate) * 1.15)) + 
+  theme_minimal() +
+  theme(legend.position = "none")
+
+```
+
+The arbitrary approach misclassifies approximately 8.3-50% of players across all positions when compared to match-based position-specific thresholds. This occurs because arbitrary thresholds use 70% and 90% of each player's own all-time max velocity, which are values that, by definition, every player can achieve. Because of this, the arbitrary method labels 100% of players as 'capable' of high-speed and sprint work, regardless of whether they actually reach match competitive intensities within their position. Match-based position-specific percentile thresholds identify only the top 30% (high-speed) and top 10% (sprint) of players within each position based on competitive performance, which makes distinctions between match-ready and developing athletes.
+
+
+
+
+Lets break down the error types:
+
+```{r}
+error_breakdown <- player_classification %>%
+  summarise(
+    `HS: Overestimated (False Pos)` = sum(hs_false_pos),
+    `HS: Underestimated (False Neg)` = sum(hs_false_neg),
+    `Sprint: Overestimated` = sum(sprint_false_pos),
+    `Sprint: Underestimated` = sum(sprint_false_neg)
+  )
+
+print(error_breakdown)
+```
+The misclassification is entirely one-directional: 15 false positives for high-speed and 30 false positives for sprint, with zero false negatives. This means the arbitrary approach never fails to identify a player who reaches match-based thresholds, but it incorrectly labels many players as capable despite not reaching actual match intensities. The lack of false negatives occurs because using each player's own max velocity as the reference guarantees that all players meet their own thresholds. However, this makes the approach not great for comparing match ready players and players still developing competitive speed capabilities.
+
+
+We can now look at the high intensity training distribution
+
+```{r}
+velocity_band_summary <- velocity_bands %>%
+  mutate(
+    low_speed = band1_pct,
+    moderate_speed = band2_pct,
+    high_speed = band3_pct,
+    sprint_speed = band4_pct,
+    high_intensity = band3_pct + band4_pct
+  ) %>%
+  select(Position, n_sessions, low_speed, moderate_speed, high_speed, 
+         sprint_speed, high_intensity)
+
+print(velocity_band_summary)
+```
+
+
+And average by team
+
+```{r}
+team_velocity_summary <- velocity_band_summary %>%
+  summarise(
+    avg_low = mean(low_speed),
+    avg_moderate = mean(moderate_speed),
+    avg_high = mean(high_speed),
+    avg_sprint = mean(sprint_speed),
+    avg_high_intensity = mean(high_intensity)
+  )
+
+print(team_velocity_summary)
+```
+
+
+And we can visualize by position
+
+```{r}
+ggplot(velocity_band_summary, aes(x = reorder(Position, -high_intensity), 
+                                   y = high_intensity, fill = Position)) +
+  geom_col() +
+  geom_text(aes(label = paste0(round(high_intensity, 1), "%")), 
+            vjust = -0.5, size = 4.5, fontface = "bold") +
+  scale_y_continuous(limits = c(0, max(velocity_band_summary$high_intensity) * 1.15)) +  
+  labs(
+    title = "High-Intensity Training Load by Position",
+    subtitle = "% of distance at speeds >12 MPH (Bands 3 + 4)",
+    x = "Position",
+    y = "High-Intensity Distance (%)"
+  ) +
+  theme_bw() +
+  theme(legend.position = "none")
+
+```
+High-intensity training exposure (>12 MPH) is extremely low across all positions, averaging only 0.9-2.7% of total distance. The remaining ~97.3% of training distance happens at speeds below 12 MPH, which suggests minimal exposure to game speed demands during training sessions. This low high intensity exposure shows why match-based thresholds are critical. With so little high speed work occurring in training, proper classification of what match-intensity actually means becomes important for making sure athletes are adequately prepared for competitive demands.
+
+
+
+
+Now we can find the recommendations by position 
+```{r}
+recommendations <- position_thresholds %>%
+  mutate(
+    low_speed_zone = "0 - 9.6 MPH",
+    moderate_zone = "9.6 - 12.0 MPH",
+    high_speed_zone = paste0("12.0 - ", round(high_speed_threshold, 1), " MPH"),
+    sprint_zone = paste0(round(high_speed_threshold, 1), " - ", 
+                         round(sprint_threshold, 1), " MPH"),
+    max_sprint_zone = paste0("> ", round(sprint_threshold, 1), " MPH")
+  ) %>%
+  select(Position, n_players, low_speed_zone, moderate_zone, 
+         high_speed_zone, sprint_zone, max_sprint_zone)
+
+print(recommendations)
+
+```
+
+Now we can look at a simple table showing high speed and sprint cutoffs
+
+```{r}
+simple_thresholds <- position_thresholds %>%
+  mutate(
+    high_speed_cutoff = paste0(round(high_speed_threshold, 1), " MPH (match-based 70th %ile)"),
+    sprint_cutoff = paste0(round(sprint_threshold, 1), " MPH (match-based 90th %ile)")
+  ) %>%
+  select(Position, n_players, high_speed_cutoff, sprint_cutoff)
+
+print(simple_thresholds)
+
+```
+
+
+Now we can compare the old and new thresholds. First we'll create a zone comparison dataset to plot 
+```{r}
+zone_comparison <- threshold_comparison %>%
+  select(Position, 
+         `OLD: Arbitrary 70%` = arbitrary_hs_avg,
+         `NEW: Match-Based 70th` = high_speed_threshold,
+         `OLD: Arbitrary 90%` = arbitrary_sprint_avg,
+         `NEW: Match-Based 90th` = sprint_threshold) %>%
+  pivot_longer(cols = -Position, names_to = "Method", values_to = "Threshold_MPH") %>%
+  mutate(
+    Type = ifelse(grepl("70", Method), "High-Speed", "Sprint"),
+    Approach = ifelse(grepl("OLD", Method), "Old (Arbitrary)", "New (Match-Based Position-Specific)")
+  )
+
+```
+
+
+
+Now plot
+```{r}
+ggplot(zone_comparison, aes(x = Position, y = Threshold_MPH, fill = Approach)) +
+  geom_col(position = "dodge") +
+  facet_wrap(~Type, ncol = 2) +
+  scale_fill_manual(values = c("Old (Arbitrary)" = "darkred", 
+                                "New (Match-Based Position-Specific)" = "forestgreen")) +
+  labs(
+    title = "Recommended Velocity Zone Thresholds",
+    subtitle = "Old arbitrary (70%/90% of max) vs new match-based position-specific percentiles",
+    x = "Position",
+    y = "Velocity Threshold (MPH)",
+    fill = "Method"
+  ) +
+  theme_bw() +
+  theme(legend.position = "bottom")
+
+ggsave("OldvsNew.png", width = 10, height = 5, dpi = 300)
+
+```
+
+
+Now I can create a comprehensive summary of the analysis
+
+```{r}
+
+#calculate effect size from regular ANOVA for reference
+ss_between <- summary(regular_anova)[[1]]["Position", "Sum Sq"]
+ss_total <- sum(summary(regular_anova)[[1]][, "Sum Sq"])
+eta_squared <- ss_between / ss_total
+
+comprehensive_summary <- data.frame(
+  Question = c(
+    "Position-specific profiles in matches?",
+    "How much faster than arbitrary?",
+    "Players misclassified?",
+    "High-intensity % in training?",
+    "Recommended approach?"
+  ),
+  
+  Finding = c(
+    paste0("MIXED (Welch's p=", round(welch_anova$p.value, 3), 
+           ", Kruskal-Wallis p=", round(kruskal_test$p.value, 3), 
+           ", η²=", round(eta_squared, 3), ")"),
+    paste0(round(gap_summary$avg_gap_70th_pct, 1), "% (70th) and ",
+           round(gap_summary$avg_gap_90th_pct, 1), "% (90th) higher"),
+    paste0(round(overall_misclass$hs_error_rate, 1), "% (", 
+           overall_misclass$hs_misclassified, "/", 
+           overall_misclass$total_players, " players)"),
+    paste0(round(team_velocity_summary$avg_high_intensity, 1), 
+           "% of distance >12 MPH"),
+    "Use match-based position-specific 70th/90th percentiles"
+  ),
+  
+  Implication = c(
+    "Statistical evidence is mixed due to variance heterogeneity, but practical differences in positional match demands justify position-specific thresholds",
+    "Arbitrary thresholds severely underestimate match-competitive intensity across all positions",
+    "Arbitrary approach fails to identify match-ready vs developing athletes within positions",
+    "Minimal game-speed exposure in training makes proper threshold definition very important for competition readiness",
+    "Replace arbitrary % of max with match-based position-specific percentiles"
+  )
+)
+
+print(comprehensive_summary)
+```
+
+### Issues with Current Velocity Zone Classification
+
+Current velocity zone classification relies on arbitrary percentage-based thresholds, which are high-speed high speed work at >= 70% of a player's all-time maximum velocity and sprinting at >= 90% of all-time maximum velocity. While this approach appears individualized, it fails to distinguish between fast and slow players within positions. 
+
+By definition, every player can achieve 70% and 90% of their own maximum velocity, meaning the arbitrary method classifies 100% of athletes as high-speed and sprint capable regardless of their actual speed relative to positional peers. This produces a 27.8 and 50 percent misclassification rate for high speed and sprint work respectably, with 15 players falsely labeled as high-speed capable and 27 falsely labeled as sprint capable when compared to match based position specific performance benchmarks. The arbitrary approach sets standards far lower than match work indicates. 
+
+
+### Match Based Position Specific Percentile Thresholds
+
+Analysis of 67 validated matches (2023-2025) shows that match based position specific percentile thresholds give a more valid and actionable alternative. Using the 70th percentile of match maximum velocities for high-speed work and the 90th percentile for sprint work, position-specific cutoffs are higher than arbitrary thresholds. These thresholds are 3-5.2 MPH higher (+25-41%) for high-speed and 0.5-2.1 MPH higher (+3-13%) for sprint work, with Goal Keepers showing the lowest values and Forwards showing the highest.
+
+Position differences in match based maximum velocity were checked using Welch's ANOVA (which does not assume equal variances) because of different variances across positions (variance ratio = 8.41, Levene's test p < 0.05). Results were marginally non-significant for the Welch's test, though Kruskal-Wallis test on medians suggested some positional variation. While the statistical evidence is mixed, practical differences in positional match demands, along with with the group sponsor's endorsement to complement already existing zones justify position-specific thresholds for competition-focused load monitoring.
+
+### Why Match-Based Thresholds?
+
+Match based position specific percentile thresholds work where arbitrary thresholds don't for three reasons:
+
+1. Ecological Validity: Training sessions inherently have constraints that limit maximum velocity during a session. Small sided games restrict space, drills help skills, and recovery sessions limit intensity. Match data isolates the true competitive capability of the athletes because matches provide consistent and genuine opportunities for maximum effort. 
+
+2. Competition-Focused Benchmarking: Training prepares athletes for competition, so thresholds should reflect the real competitive demands. Match-based cutoffs make sure that load monitoring answers the question: "Are we exposing players to game-level intensity?" Using the 70th and 90th percentiles of match velocities identifies the top 30% (high-speed) and top 10% (sprint) of competitive performances within each position. The position split provides a meaningful distinction that differentiates match-ready athletes from athletes who are still developing competitive speed abilities.
+
+3. Important for Low-Intensity Programs: High intensity training exposure is very low across all positions (0.9-2.7% of total distance >12 MPH), with the remaining ~97.3% of training occurring at speeds below 12 MPH. With so little game speed work already occurring in training, correct classification of what match-intensity means becomes very important for ensuring that the limited high speed exposure is correctly monitored.
+
+### Practical Application
+
+This analysis supports using match based position specific velocity zones based on these thresholds:
+
+Defenders: High-speed >= 17.7 MPH, Sprint 18.2 >= MPH
+Forwards: High-speed >= 17.7 MPH, Sprint 19 >= MPH
+Goal Keepers: High-speed 15 >=  MPH, Sprint 15.9 ≥ MPH
+Midfielders: High-speed >= 17.8 MPH, Sprint 18.4 >= MPH
+
+
+These cutoffs support the arbitrary 70%/90% of max approach with derived benchmarks that reflect legitimate competitive performance distributions within each position. Using match based position specific standards makes sure that velocity zone classifications are based on game demands rather than training artifacts. 
+
+
+Benefits for the Change:
+
+More accurate talent identification: Identifying the fastest 10-30% of players per position based on performance
+Better load management: Prescribing correct high-speed exposure relative to competitive demands (ex., "Forwards accumulated 85% of position-appropriate match high-speed distance this week")
+Improved performance monitoring: Tracking changes in high speed running relative to competition specific benchmarks
+
+
+### Key Takeaways From The Analysis
+
+Match based position specific percentile thresholds create distinctions between match ready and developing athletes within each position, setting standards 25-42% higher for high-speed work and 4-14% higher for sprint work compared to the arbitrary approach.
+
+Despite mixed statistical evidence for positional differences in max game speed (Welch's ANOVA p = 0.056), match-based position-specific thresholds are justified by 
+(1) practical differences in positional match demands and roles 
+(2) ecological validity of competition based benchmarks
+(3) endorsement from sponsor to complement pre-existing zones 
+(4) better use for individualized load monitoring and talent identification
+
+This recommendation is also helped by the extremely low exposure to high intensity training (0.9-2.7% of total distance), making threshold definition incredibly important for optimizing the limited game speed work that does occur and making sure that athletes are prepared for competitive match intensity.
+
+
+
+
+
+
+#___________________________________________________________________________________________________________________________
+
+## Flow Chart
+
+
+```{r}
+library(ggplot2)
+library(grid)
+library(gridExtra)
+# Create flowchart with full descriptions
+ggplot() +
+  
+  # ROW 1 BOXES (Left to Right)
+  # Box 1: Raw Data
+  annotate("rect", xmin = 0.6, xmax = 1.4, ymin = 1.7, ymax = 2.3,
+           fill = '#E8F4F8', color = "black", size = 1.2) +
+  annotate("text", x = 1, y = 2.15, 
+           label = "Raw Data Sources\n(2023-2025)", 
+           size = 4, fontface = "bold") +
+  annotate("text", x = 1, y = 1.9, 
+           label = "• Catapult GPS\n  (~23,696 sessions)\n• Match schedules (70 games)\n• Player stats", 
+           size = 3, lineheight = 0.9) +
+  
+  # Box 2: Standardization
+  annotate("rect", xmin = 1.6, xmax = 2.4, ymin = 1.7, ymax = 2.3,
+           fill = '#B3D9FF', color = "black", size = 1.2) +
+  annotate("text", x = 2, y = 2.15, 
+           label = "Data\nStandardization", 
+           size = 4, fontface = "bold") +
+  annotate("text", x = 2, y = 1.9, 
+           label = "• Column names normalized\n• Date/numeric parsing\n• Missing fields dropped", 
+           size = 3, lineheight = 0.9) +
+  
+  # Box 3: Position Backfilling
+  annotate("rect", xmin = 2.6, xmax = 3.4, ymin = 1.7, ymax = 2.3,
+           fill = '#FFD9B3', color = "black", size = 1.2) +
+  annotate("text", x = 3, y = 2.15, 
+           label = "Position\nBackfilling", 
+           size = 4, fontface = "bold") +
+  annotate("text", x = 3, y = 1.9, 
+           label = "• 6,735 missing positions\n• Player history lookup\n• 100% recovery", 
+           size = 3, lineheight = 0.9) +
+  
+  # ROW 2 BOXES (Right to Left)
+  # Box 4: Quality Filtering
+  annotate("rect", xmin = 2.6, xmax = 3.4, ymin = 0.7, ymax = 1.3,
+           fill = '#FFB3BA', color = "black", size = 1.2) +
+  annotate("text", x = 3, y = 1.15, 
+           label = "Quality Filtering\n& Merging", 
+           size = 4, fontface = "bold") +
+  annotate("text", x = 3, y = 0.9, 
+           label = "• GPS errors removed\n• Defender positions consolidated\n• Intensity metrics", 
+           size = 3, lineheight = 0.9) +
+  
+  # Box 5: Integration
+  annotate("rect", xmin = 1.6, xmax = 2.4, ymin = 0.7, ymax = 1.3,
+           fill = '#D4EDC9', color = "black", size = 1.2) +
+  annotate("text", x = 2, y = 1.15, 
+           label = "Integration &\nFeature Engineering", 
+           size = 4, fontface = "bold") +
+  annotate("text", x = 2, y = 0.9, 
+           label = "• Join Catapult + Schedule\n• Calculate MD-, EWMA, ACWR\n• Classify phases", 
+           size = 3, lineheight = 0.9) +
+  
+  # Box 6: Final Output
+  annotate("rect", xmin = 0.6, xmax = 1.4, ymin = 0.7, ymax = 1.3,
+           fill = '#90EE90', color = "black", size = 1.5) +
+  annotate("text", x = 1, y = 1.15, 
+           label = "Analysis-Ready\nDatasets", 
+           size = 4, fontface = "bold") +
+  annotate("text", x = 1, y = 0.9, 
+           label = "• Session-level (16,800)\n• Match-level stats\n• 4 positions filled", 
+           size = 3, lineheight = 0.9) +
+  
+  # ARROWS - Row 1 (left to right)
+  annotate("segment", x = 1.4, xend = 1.6, y = 2, yend = 2,
+           arrow = arrow(length = unit(0.3, "cm"), type = "closed"), 
+           size = 1.2, color = "black") +
+  annotate("segment", x = 2.4, xend = 2.6, y = 2, yend = 2,
+           arrow = arrow(length = unit(0.3, "cm"), type = "closed"), 
+           size = 1.2, color = "black") +
+  
+  # ARROW - Down from backfill to quality
+  annotate("segment", x = 3, xend = 3, y = 1.7, yend = 1.3,
+           arrow = arrow(length = unit(0.3, "cm"), type = "closed"), 
+           size = 1.2, color = "black") +
+  
+  # ARROWS - Row 2 (right to left)
+  annotate("segment", x = 2.6, xend = 2.4, y = 1, yend = 1,
+           arrow = arrow(length = unit(0.3, "cm"), type = "closed"), 
+           size = 1.2, color = "black") +
+  annotate("segment", x = 1.6, xend = 1.4, y = 1, yend = 1,
+           arrow = arrow(length = unit(0.3, "cm"), type = "closed"), 
+           size = 1.2, color = "black") +
+  
+  # Formatting
+  coord_fixed(ratio = 1) +
+  theme_void() +
+  xlim(0.4, 3.6) +
+  ylim(0.5, 2.5)
+
+ggsave("flowchart_cleaning.png", width = 14, height = 8, dpi = 300)
+```
+
+
+
+
+
+```{r}
+# ==============================================================================
+# SLIDE 2 VISUAL: WHY ARBITRARY THRESHOLDS DON'T WORK
+# ==============================================================================
+
+# Create example data showing the problem
+arbitrary_problem <- data.frame(
+  Player = c("Player A\n(Slow)", "Player B\n(Average)", "Player C\n(Fast)"),
+  Max_Velocity = c(15, 18, 21),
+  Arbitrary_70 = c(15 * 0.70, 18 * 0.70, 21 * 0.70),
+  Arbitrary_90 = c(15 * 0.90, 18 * 0.90, 21 * 0.90)
+) %>%
+  mutate(
+    Player = factor(Player, levels = c("Player A\n(Slow)", "Player B\n(Average)", "Player C\n(Fast)"))
+  )
+
+# Reshape for plotting
+arbitrary_problem_long <- arbitrary_problem %>%
+  tidyr::pivot_longer(
+    cols = c(Max_Velocity, Arbitrary_70, Arbitrary_90),
+    names_to = "Threshold_Type",
+    values_to = "Velocity"
+  ) %>%
+  mutate(
+    Threshold_Type = factor(Threshold_Type, 
+                           levels = c("Max_Velocity", "Arbitrary_70", "Arbitrary_90"),
+                           labels = c("All-Time Max", "High-Speed\n(70% of max)", "Sprint\n(90% of max)"))
+  )
+
+ggplot(arbitrary_problem_long, aes(x = Player, y = Velocity, fill = Threshold_Type)) +
+  geom_col(position = "dodge", width = 0.7, alpha = 0.85) +
+  geom_text(aes(label = paste0(round(Velocity, 1), " MPH")), 
+            position = position_dodge(width = 0.7), 
+            vjust = -0.3, size = 4.5, fontface = "bold") +
+  
+  scale_fill_manual(values = c(
+    "All-Time Max" = "#000000",              # Black
+    "High-Speed\n(70% of max)" = "#DC4405",  # Orange/Red
+    "Sprint\n(90% of max)" = "#CFB87C"       # CU Gold
+  )) +
+  
+  labs(
+    title = "Arbitrary Thresholds Don't Identify Fast Players",
+    x = "",
+    y = "Velocity (MPH)",
+    fill = "Threshold Type"
+  ) +
+  
+  scale_y_continuous(limits = c(0, 23), breaks = seq(0, 22, by = 2)) +
+  
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    axis.title.y = element_text(size = 12, face = "bold"),
+    axis.text.x = element_text(size = 11, face = "bold"),
+    axis.text.y = element_text(size = 10),
+    legend.position = "bottom",
+    legend.title = element_text(size = 11, face = "bold"),
+    legend.text = element_text(size = 10),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+
+```
+
+
+```{r}
+
+# Use your existing velocity_bands data
+bands_for_slide <- velocity_bands %>%
+  select(Position, band1_pct, band2_pct, band3_pct, band4_pct) %>%
+  pivot_longer(cols = starts_with("band"), names_to = "band", values_to = "percentage") %>%
+  mutate(
+    # REVERSE the factor levels for stacking order
+    band = factor(band, 
+                  levels = c("band4_pct", "band3_pct", "band2_pct", "band1_pct"),  # Band 4 first = stacks last (right side)
+                  labels = c("Band 4 (14.4+ MPH)\nSprint",
+                            "Band 3 (12-14.4 MPH)\nHigh-Speed", 
+                            "Band 2 (9.6-12 MPH)\nModerate",
+                            "Band 1 (0-9.6 MPH)\nLow-Speed")),
+    Position = factor(Position, levels = c("Forward", "Midfielder", "Defender", "Goal Keeper"))
+  )
+
+# Calculate average percentages for each band
+band_averages <- bands_for_slide %>%
+  group_by(band) %>%
+  summarise(avg_pct = mean(percentage), .groups = "drop")
+
+# Create new labels with percentages - REVERSED ORDER FOR LEGEND
+bands_for_slide <- bands_for_slide %>%
+  left_join(band_averages, by = "band") %>%
+  mutate(
+    band_with_pct = paste0(as.character(band), " [", round(avg_pct, 1), "%]"),
+    band_with_pct = factor(band_with_pct, 
+                          levels = c(
+                            paste0("Band 1 (0-9.6 MPH)\nLow-Speed [", round(band_averages$avg_pct[band_averages$band == "Band 1 (0-9.6 MPH)\nLow-Speed"], 1), "%]"),
+                            paste0("Band 2 (9.6-12 MPH)\nModerate [", round(band_averages$avg_pct[band_averages$band == "Band 2 (9.6-12 MPH)\nModerate"], 1), "%]"),
+                            paste0("Band 3 (12-14.4 MPH)\nHigh-Speed [", round(band_averages$avg_pct[band_averages$band == "Band 3 (12-14.4 MPH)\nHigh-Speed"], 1), "%]"),
+                            paste0("Band 4 (14.4+ MPH)\nSprint [", round(band_averages$avg_pct[band_averages$band == "Band 4 (14.4+ MPH)\nSprint"], 1), "%]")
+                          ))
+  )
+
+# Get the actual levels for scale_fill_manual
+legend_levels <- levels(bands_for_slide$band_with_pct)
+
+ggplot(bands_for_slide, aes(x = percentage, y = Position, fill = band_with_pct)) +
+  geom_col(position = position_stack(reverse = TRUE), width = 0.7) +  # ADD reverse = TRUE
+  
+  # Show labels only for larger bands
+  geom_text(aes(label = ifelse(percentage >= 3, paste0(round(percentage, 1), "%"), "")),
+            position = position_stack(vjust = 0.5, reverse = TRUE),  # ADD reverse = TRUE
+            size = 4.5, color = "white", fontface = "bold") +
+  
+  # Colors in order: Band 1, Band 2, Band 3, Band 4
+  scale_fill_manual(
+    values = setNames(
+      c("#8B9DC3", "#DEB887", "#F4A460", "#DC143C"),
+      legend_levels
+    )
+  ) +
+  
+  scale_x_continuous(
+    breaks = seq(0, 100, by = 10),
+    expand = c(0, 0)
+  ) +
+  
+  labs(
+    title = "Training Load Heavily Skewed Toward Low-Intensity Work",
+    x = "Percentage of Total Distance (%)",
+    y = "",
+    fill = "Velocity Band [Avg %]"
+  ) +
+  
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    axis.text.y = element_text(size = 12, face = "bold"),
+    axis.text.x = element_text(size = 11),
+    axis.title.x = element_text(size = 12, face = "bold"),
+    legend.position = "bottom",
+    legend.title = element_text(size = 11, face = "bold"),
+    legend.text = element_text(size = 9, lineheight = 0.9),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+ggsave("velocity_band_distribution_reversed_fixed.png", width = 11, height = 6, dpi = 300)
+```
+
+```{r}
+# Define parameters for a smooth normal distribution
+mean_val <- 18
+sd_val <- 2
+
+# Calculate percentiles from theoretical normal distribution
+p70 <- qnorm(0.70, mean = mean_val, sd = sd_val)
+p90 <- qnorm(0.90, mean = mean_val, sd = sd_val)
+
+# Create smooth x values
+x_vals <- seq(mean_val - 4*sd_val, mean_val + 4*sd_val, length.out = 1000)
+
+# Create data frame for plotting
+smooth_dist <- data.frame(
+  x = x_vals,
+  y = dnorm(x_vals, mean = mean_val, sd = sd_val)
+)
+
+# Get max density for label positioning
+max_density <- dnorm(mean_val, mean = mean_val, sd = sd_val)
+
+ggplot(smooth_dist, aes(x = x, y = y)) +
+  
+  # Below 70th percentile (gray)
+  geom_area(data = smooth_dist %>% filter(x < p70),
+            fill = "#A2A4A3", alpha = 0.6) +
+  
+  # 70th to 90th percentile (green - high-speed)
+  geom_area(data = smooth_dist %>% filter(x >= p70 & x < p90),
+            fill = "#4A7729", alpha = 0.6) +
+  
+  # Above 90th percentile (gold - sprint)
+  geom_area(data = smooth_dist %>% filter(x >= p90),
+            fill = "#CFB87C", alpha = 0.6) +
+  
+  # Smooth outline
+  geom_line(linewidth = 1.2, color = "#000000") +
+  
+  # Threshold lines
+  geom_vline(xintercept = p70, color = "#4A7729", linewidth = 1.8, linetype = "dashed") +
+  geom_vline(xintercept = p90, color = "#CFB87C", linewidth = 1.8, linetype = "dashed") +
+  
+  # Labels at TOP - MORE separation
+  annotate("label", x = p70, y = max_density * 1.15, 
+           label = "70th Percentile\n(High-Speed)", 
+           color = "white", fill = "#4A7729", fontface = "bold", size = 4.5, 
+           hjust = 0.5, label.padding = unit(0.5, "lines")) +
+  
+  annotate("label", x = p90, y = max_density * 1.45, 
+           label = "90th Percentile\n(Sprint)", 
+           color = "white", fill = "#CFB87C", fontface = "bold", size = 4.5, 
+           hjust = 0.5, label.padding = unit(0.5, "lines")) +
+  
+  labs(
+    x = "Maximum Velocity (MPH)",
+    y = "",
+    caption = "Example distribution: Midfielder match maximum velocities"
+  ) +
+  
+  # Expand y-axis to make room for top labels
+  coord_cartesian(ylim = c(0, max_density * 1.6)) +
+  
+  theme_minimal() +
+  theme(
+    axis.title.x = element_text(size = 13, face = "bold"),
+    axis.text.x = element_text(size = 11),
+    axis.text.y = element_blank(),
+    panel.grid = element_blank(),
+    axis.ticks.y = element_blank(),
+    plot.caption = element_text(size = 11, hjust = 0.5, color = "gray50", 
+                                 margin = margin(t = 10)),
+    plot.margin = margin(20, 20, 20, 20)
+  )
+
+ggsave("percentile_smooth_normal.png", width = 12, height = 7, dpi = 300)
+```
+
+
+
+
+```{r}
+
+# Prepare table data from threshold_comparison
+threshold_table <- threshold_comparison %>%
+  select(Position, high_speed_threshold, sprint_threshold, n_players) %>%
+  arrange(Position)
+
+# Add sample sizes from match data
+sample_sizes <- player_max_velocities_match %>%
+  group_by(Position) %>%
+  summarise(n_obs = n(), .groups = "drop")
+
+threshold_table <- threshold_table %>%
+  left_join(sample_sizes, by = "Position") %>%
+  mutate(
+    Position = factor(Position, levels = c("Defender", "Forward", "Goal Keeper", "Midfielder")),
+    high_speed_threshold = round(high_speed_threshold, 1),
+    sprint_threshold = round(sprint_threshold, 1)
+  ) %>%
+  arrange(Position)
+
+# Convert to long format for ggplot table
+table_long <- threshold_table %>%
+  mutate(
+    Position_Label = as.character(Position),
+    HS_Label = paste0(high_speed_threshold, " MPH"),
+    Sprint_Label = paste0(sprint_threshold, " MPH"),
+    Sample_Label = paste0(n_obs, " players")  # CHANGED: "obs" → "players"
+  ) %>%
+  select(Position_Label, HS_Label, Sprint_Label, Sample_Label) %>%
+  mutate(row_id = row_number()) %>%
+  tidyr::pivot_longer(cols = -row_id, names_to = "Metric", values_to = "Value") %>%
+  mutate(
+    Metric = factor(Metric, 
+                   levels = c("Position_Label", "HS_Label", "Sprint_Label", "Sample_Label"),
+                   labels = c("Position", "High-Speed\n(70th %ile)", "Sprint\n(90th %ile)", "Sample Size")),
+    row_id = factor(row_id, levels = 4:1)  # Reverse order for top-to-bottom
+  )
+
+# Create table visualization
+ggplot(table_long, aes(x = Metric, y = row_id, label = Value)) +
+  geom_tile(fill = "white", color = "#000000", linewidth = 1.5) +
+  geom_text(size = 6, fontface = "bold") +
+  scale_x_discrete(position = "top") +
+  scale_y_discrete(breaks = NULL) +
+  labs(
+    title = "Recommended Position-Specific Velocity Thresholds",
+    subtitle = "Based on 67 validated matches (2023-2025)",
+    x = NULL,
+    y = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 18, face = "bold", hjust = 0.5, margin = margin(b = 10)),
+    plot.subtitle = element_text(size = 13, hjust = 0.5, color = "gray40", margin = margin(b = 20)),
+    axis.text.x = element_text(size = 13, face = "bold"),
+    axis.text.y = element_blank(),
+    panel.grid = element_blank(),
+    plot.margin = margin(20, 20, 20, 20)
+  )
+
+ggsave("recommended_thresholds_table.png", width = 10, height = 6, dpi = 300)
+```
+```{r}
+names(threshold_comparison)
+```
+
+
+
+
+```{r}
+# Filter for 2024 only
+monthly_2024 <- monthly_by_year %>%
+  filter(year == 2024)
+
+# Create the plot
+ggplot(monthly_2024, 
+       aes(x = factor(month_name, levels = month.abb), 
+           y = avg_load, 
+           group = 1)) +
+  
+  # Phase shading - extended to boundaries
+  annotate("rect", xmin = -Inf, xmax = 6, ymin = -Inf, ymax = Inf, 
+           alpha = 0.05, fill = "lightblue") +
+  annotate("rect", xmin = 6, xmax = 8, ymin = -Inf, ymax = Inf, 
+           alpha = 0.05, fill = "orange") +
+  annotate("rect", xmin = 8, xmax = Inf, ymin = -Inf, ymax = Inf, 
+           alpha = 0.05, fill = "darkred") +
+  
+  # Phase labels
+  annotate("text", x = 3, y = 100, 
+           label = "OFF-SEASON", size = 4, fontface = "bold") +
+  annotate("text", x = 7, y = 100, 
+           label = "PRE", size = 4, fontface = "bold") +
+  annotate("text", x = 9.5, y = 100, 
+           label = "IN-SEASON", size = 4, fontface = "bold") +
+  
+  # Line and points
+  geom_line(linewidth = 1.5, color = "#457B9D", alpha = 0.9) +
+  geom_point(size = 4, color = "#457B9D") +
+  
+  # Phase dividers
+  geom_vline(xintercept = 6, linetype = "dashed", linewidth = 0.8) +
+  geom_vline(xintercept = 8, linetype = "dashed", linewidth = 0.8) +
+  
+  # Value labels
+  geom_text(aes(label = round(avg_load, 0)), 
+            vjust = -1.5, size = 4, fontface = "bold", color = "#457B9D") +
+  
+  scale_x_discrete(limits = month.abb[1:11]) +
+  scale_y_continuous(limits = c(0, 450), breaks = seq(0, 450, by = 50)) +
+  
+  labs(
+    title = "2024 Monthly Training Load Progression",
+    subtitle = "Average load across seasonal phases (January - November, no Jan/May/Jun/Dec data)",
+    x = "Month",
+    y = "Average Total Player Load (AU)"
+  ) +
+  
+  theme_bw() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5, color = "gray40"),
+    axis.title = element_text(size = 12, face = "bold"),
+    axis.text.x = element_text(size = 11, face = "bold"),
+    axis.text.y = element_text(size = 10),
+    panel.grid.minor = element_blank()
+  )
+
+ggsave("monthly_load_2024.png", width = 11, height = 6, dpi = 300)
+```
+
